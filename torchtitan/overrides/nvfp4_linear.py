@@ -561,12 +561,12 @@ def _with_nvfp4_buffers(state: dict, cfg: NVFP4Linear.Config) -> dict:
 
 
 def _to_nvfp4_colwise(
-    cfg: Linear.Config, *, sequence_parallel: bool
+    cfg: Linear.Config, *, sequence_parallel: bool, cls=NVFP4Linear.Config
 ) -> NVFP4Linear.Config:
     base = cfg.sharding_config
     nvfp4_cfg = derive(
         cfg,
-        NVFP4Linear.Config,
+        cls,
         tensor_parallel_style="colwise",
         expects_sequence_parallel=sequence_parallel,
     )
@@ -580,18 +580,18 @@ def _to_nvfp4_colwise(
     )
     return derive(
         nvfp4_cfg,
-        NVFP4Linear.Config,
+        cls,
         sharding_config=sc,
     )
 
 
 def _to_nvfp4_rowwise(
-    cfg: Linear.Config, *, sequence_parallel: bool
+    cfg: Linear.Config, *, sequence_parallel: bool, cls=NVFP4Linear.Config
 ) -> NVFP4Linear.Config:
     base = cfg.sharding_config
     nvfp4_cfg = derive(
         cfg,
-        NVFP4Linear.Config,
+        cls,
         tensor_parallel_style="rowwise",
         expects_sequence_parallel=sequence_parallel,
     )
@@ -622,7 +622,7 @@ def _to_nvfp4_rowwise(
     )
     return derive(
         nvfp4_cfg,
-        NVFP4Linear.Config,
+        cls,
         sharding_config=sc,
     )
 
@@ -736,3 +736,83 @@ def nvfp4_attention(cfg: GQAttention.Config) -> GQAttention.Config:
         wo=_to_nvfp4_rowwise(cfg.wo, sequence_parallel=sp),
         sharding_config=_keep_sp_input(cfg.sharding_config),
     )
+
+
+# --- DeepSeek V3 MLA attention (Attention.Config) -----------------------------
+# DSV3-specific; imported lazily so this module stays loadable for non-DSV3 models.
+try:
+    from torchtitan.models.deepseek_v3.model import Attention as _MLAAttention
+except ImportError:
+    _MLAAttention = None
+
+
+class MLANVFP4Linear(NVFP4Linear):
+    """NVFP4Linear for DSV3 MLA projections, restricted to TP=1.
+
+    MLA NVFP4 is only wired for tensor_parallel_degree=1 (the reference DSV3
+    recipe -- EP + PP, no TP). The TP>1 sequence-parallel path is unimplemented:
+    keeping the block input sequence-sharded leaves ``k_pe`` (from the
+    Replicate-weight ``wkv_a``) seq-sharded while ``wkv_b``'s colwise all-gather
+    makes ``k_nope`` full-sequence, so ``k = cat([k_nope, k_pe])`` mismatches. This
+    subclass asserts that loudly instead of silently mis-gathering.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(NVFP4Linear.Config):
+        pass
+
+    def _validate(self, parallel_dims: ParallelDims) -> None:
+        if parallel_dims.tp_enabled:
+            raise ValueError(
+                "DeepSeek V3 MLA NVFP4 is only supported at tensor_parallel_degree=1. "
+                "The TP>1 sequence-parallel path is unimplemented: k_pe (from the "
+                "Replicate-weight wkv_a) stays sequence-sharded while wkv_b's colwise "
+                "all-gather makes k_nope full-sequence, so k=cat([k_nope, k_pe]) "
+                "mismatches. Run MLA attention with tensor_parallel_degree=1."
+            )
+        super()._validate(parallel_dims)
+
+
+def _mla_dims_128_aligned(lin: Linear.Config) -> bool:
+    return lin.in_features % _NVFP4_BLOCK == 0 and lin.out_features % _NVFP4_BLOCK == 0
+
+
+def _mla_colwise(lin: Linear.Config) -> Linear.Config:
+    # sequence_parallel=False -> MLANVFP4Linear._validate asserts under TP>1.
+    if not _mla_dims_128_aligned(lin):
+        return lin
+    return _to_nvfp4_colwise(
+        lin, sequence_parallel=False, cls=MLANVFP4Linear.Config
+    )
+
+
+def _mla_rowwise(lin: Linear.Config) -> Linear.Config:
+    if not _mla_dims_128_aligned(lin):
+        return lin
+    return _to_nvfp4_rowwise(
+        lin, sequence_parallel=False, cls=MLANVFP4Linear.Config
+    )
+
+
+if _MLAAttention is not None:
+
+    @override(
+        "nvfp4_mla_attention",
+        target=_MLAAttention.Config,
+        description="NVFP4 DeepSeek V3 MLA attention projections wq/wkv_b/wo (TP=1).",
+    )
+    def nvfp4_mla_attention(cfg: "_MLAAttention.Config") -> "_MLAAttention.Config":
+        _require_torchao()
+        _require_sharding_config(cfg.sharding_config)
+        # wkv_a (Replicate, 576 not 128-aligned) and the norms stay bf16. No
+        # _keep_sp_input: the block keeps gathering x to Replicate, which is correct
+        # at TP=1; TP>1 is rejected by MLANVFP4Linear._validate.
+        deltas = {
+            "wkv_b": _mla_colwise(cfg.wkv_b),
+            "wo": _mla_rowwise(cfg.wo),
+        }
+        if cfg.wq is not None:
+            deltas["wq"] = _mla_colwise(cfg.wq)
+        elif cfg.wq_b is not None:  # q_lora_rank > 0: wq_a stays bf16 (Replicate)
+            deltas["wq_b"] = _mla_colwise(cfg.wq_b)
+        return derive(cfg, _MLAAttention.Config, **deltas)
