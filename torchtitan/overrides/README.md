@@ -467,6 +467,15 @@ for the full recipe.
   codes instead of bf16. `torchao`
   is an optional dependency (imported lazily; the factory raises a clear error if
   selected without it).
+- `torchtitan/overrides/nvfp4_grouped_experts.py` — **the MoE / expert-parallel
+  example.** Swaps `GroupedExperts` for `NVFP4GroupedExperts`, which keeps bf16
+  expert weights and quantizes the three grouped GEMMs (gate/up/down) to NVFP4 via
+  torchao's grouped-mm kernels, and swaps in `TorchAOTokenDispatcher` so token
+  groups are padded to a multiple of 128. Composes with the `nvfp4_linear`
+  override (disjoint subtrees: experts under `*.moe.experts` vs. the attention/FFN
+  blocks). `torchao` is an optional dependency (imported lazily; the factory
+  raises a clear error if selected without it, and the Blackwell/Triton/PyTorch
+  requirement is checked in `parallelize()`).
 
 The `TritonRoPE` snippets above are illustrative — no `triton_rope.py` is
 shipped — but RoPE is a fully valid override target (`helion_rope.py` is a real
