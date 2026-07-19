@@ -677,6 +677,20 @@ def _require_sharding_config(base: ShardingConfig | None) -> None:
 )
 def nvfp4_feed_forward(cfg: FeedForward.Config) -> FeedForward.Config:
     _require_torchao()
+    # Per-FQN skip: NVFP4 requires every local GEMM dim divisible by 128. Leave
+    # the whole block bf16 when any of its linears is not 128-aligned (e.g. the
+    # DSV3-16B dense-layer FFN, hidden=10944) rather than hard-failing later in
+    # NVFP4Linear._validate. Block-level because _keep_sp_input rewrites the
+    # shared block input boundary for all three linears together.
+    if not all(_lin_dims_128_aligned(l) for l in (cfg.w1, cfg.w3, cfg.w2)):
+        logger.warning(
+            "nvfp4 override skipped a feed-forward block: a linear dim is not "
+            "%d-aligned (w1/w3 out=%d, w2 in=%d), so the block stays bf16.",
+            _NVFP4_BLOCK,
+            cfg.w1.out_features,
+            cfg.w2.in_features,
+        )
+        return cfg
     _require_sharding_config(cfg.sharding_config)
     sp = _block_input_is_sp(cfg.sharding_config, "x")
     return derive(
@@ -704,11 +718,22 @@ def _qkv_linears(qkv) -> list[Linear.Config] | None:
 )
 def nvfp4_attention(cfg: GQAttention.Config) -> GQAttention.Config:
     _require_torchao()
-    if _qkv_linears(cfg.qkv_linear) is None:
+    qkv_linears = _qkv_linears(cfg.qkv_linear)
+    if qkv_linears is None:
         logger.warning(
             "nvfp4 override skipped an attention block: qkv_linear type %s is not "
             "QKVLinear/FusedQKVLinear, so its projections stay bf16.",
             type(cfg.qkv_linear).__name__,
+        )
+        return cfg
+    # Per-FQN skip: leave the whole block bf16 when any linear dim is not
+    # 128-aligned rather than hard-failing in NVFP4Linear._validate (block-level
+    # because _keep_sp_input rewrites the shared block input for all of them).
+    if not all(_lin_dims_128_aligned(l) for l in (*qkv_linears, cfg.wo)):
+        logger.warning(
+            "nvfp4 override skipped an attention block: a projection dim is not "
+            "%d-aligned, so the block stays bf16.",
+            _NVFP4_BLOCK,
         )
         return cfg
     _require_sharding_config(cfg.sharding_config)
@@ -773,13 +798,13 @@ class MLANVFP4Linear(NVFP4Linear):
         super()._validate(parallel_dims)
 
 
-def _mla_dims_128_aligned(lin: Linear.Config) -> bool:
+def _lin_dims_128_aligned(lin: Linear.Config) -> bool:
     return lin.in_features % _NVFP4_BLOCK == 0 and lin.out_features % _NVFP4_BLOCK == 0
 
 
 def _mla_colwise(lin: Linear.Config) -> Linear.Config:
     # sequence_parallel=False -> MLANVFP4Linear._validate asserts under TP>1.
-    if not _mla_dims_128_aligned(lin):
+    if not _lin_dims_128_aligned(lin):
         return lin
     return _to_nvfp4_colwise(
         lin, sequence_parallel=False, cls=MLANVFP4Linear.Config
@@ -787,7 +812,7 @@ def _mla_colwise(lin: Linear.Config) -> Linear.Config:
 
 
 def _mla_rowwise(lin: Linear.Config) -> Linear.Config:
-    if not _mla_dims_128_aligned(lin):
+    if not _lin_dims_128_aligned(lin):
         return lin
     return _to_nvfp4_rowwise(
         lin, sequence_parallel=False, cls=MLANVFP4Linear.Config
