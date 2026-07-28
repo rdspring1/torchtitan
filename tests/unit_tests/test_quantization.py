@@ -29,6 +29,47 @@ def test_no_float8_by_default():
             assert not isinstance(lc, Float8Linear.Config)
 
 
+def test_nvfp4_v2_rht_cadence_is_deterministic_and_in_place():
+    from torchtitan.components.quantization.nvfp4_v2 import NVFP4RHTCadenceManager
+
+    class RHTModule(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.register_buffer("_wgrad_rht", torch.ones(128, dtype=torch.int8))
+            self.register_buffer("_dgrad_rht", torch.ones(128, dtype=torch.int8))
+
+    model = torch.nn.Module()
+    model.proj = RHTModule()
+    model.other = RHTModule()
+    manager = NVFP4RHTCadenceManager([model], seed=1234)
+    wgrad_id = id(model.proj._wgrad_rht)
+    dgrad_id = id(model.proj._dgrad_rht)
+
+    manager.refresh_dgrad(step=7)
+    dgrad_step_7 = model.proj._dgrad_rht.clone()
+    manager.refresh_wgrad(step=7, microbatch=0)
+    wgrad_microbatch_0 = model.proj._wgrad_rht.clone()
+    assert not torch.equal(model.proj._wgrad_rht, model.other._wgrad_rht)
+    manager.refresh_wgrad(step=7, microbatch=1)
+
+    assert id(model.proj._wgrad_rht) == wgrad_id
+    assert id(model.proj._dgrad_rht) == dgrad_id
+    assert not torch.equal(model.proj._wgrad_rht, wgrad_microbatch_0)
+    assert torch.equal(model.proj._dgrad_rht, dgrad_step_7)
+
+    manager.refresh_dgrad(step=8)
+    assert not torch.equal(model.proj._dgrad_rht, dgrad_step_7)
+
+    replay = torch.nn.Module()
+    replay.proj = RHTModule()
+    replay.other = RHTModule()
+    replay_manager = NVFP4RHTCadenceManager([replay], seed=1234)
+    replay_manager.refresh_dgrad(step=7)
+    replay_manager.refresh_wgrad(step=7, microbatch=0)
+    assert torch.equal(replay.proj._dgrad_rht, dgrad_step_7)
+    assert torch.equal(replay.proj._wgrad_rht, wgrad_microbatch_0)
+
+
 def test_float8_applied_by_model_registry():
     pytest.importorskip("torchao")
     config_manager = ConfigManager()

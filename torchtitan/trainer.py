@@ -26,6 +26,7 @@ from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper, IGNORE_INDE
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.quantization.nvfp4_v2 import NVFP4RHTCadenceManager
 from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
 from torchtitan.components.validate import BaseValidator, Validator
@@ -492,6 +493,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         # These attributes must be initialized before checkpoint loading.
         self.step = 0
         self.ntokens_seen = 0
+        self.nvfp4_rht_manager = NVFP4RHTCadenceManager(
+            self.model_parts,
+            config.debug.seed if config.debug.seed is not None else 0,
+        )
 
         # build tokenizer
         self.tokenizer = config.tokenizer.build(tokenizer_path=config.hf_assets_path)
@@ -760,6 +765,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ):
         self.optimizers.zero_grad()
+        self.nvfp4_rht_manager.refresh_dgrad(self.step)
         # Save per-optimizer-group learning rates for logging
         lr_metrics = self.lr_schedulers.get_metrics()
 
@@ -789,7 +795,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # Process each microbatch: move to GPU, forward/backward, then free
         accumulated_losses = []
-        for input_dict, labels in microbatches:
+        for microbatch_idx, (input_dict, labels) in enumerate(microbatches):
+            self.nvfp4_rht_manager.refresh_wgrad(self.step, microbatch_idx)
             # Move tensors to GPU
             for k, v in input_dict.items():
                 if isinstance(v, torch.Tensor):

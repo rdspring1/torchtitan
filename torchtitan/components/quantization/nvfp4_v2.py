@@ -29,6 +29,7 @@ never does. So the converter supports single-GPU and FSDP-only; the TP branch in
 ``forward`` is retained as latent capability for a future ParallelStyle wiring.
 """
 
+import hashlib
 from dataclasses import dataclass, field
 
 import torch
@@ -44,6 +45,54 @@ _NVFP4_BLOCK = 128
 
 _TP_STYLE_COLWISE = "colwise"
 _TP_STYLE_ROWWISE = "rowwise"
+
+
+class NVFP4RHTCadenceManager:
+    """Deterministically refresh NVFP4 RHT signs without replacing buffers."""
+
+    def __init__(self, model_parts: list[torch.nn.Module], seed: int):
+        self.seed = seed
+        self.modules = [
+            (
+                ".".join(part for part in fqn.split(".") if part != "_orig_mod")
+                or "<root>",
+                module,
+            )
+            for model_part in model_parts
+            for fqn, module in model_part.named_modules()
+            if hasattr(module, "_wgrad_rht") and hasattr(module, "_dgrad_rht")
+        ]
+
+    def _refresh(
+        self, *, lane: str, step: int, microbatch: int, buffer_name: str
+    ) -> None:
+        for fqn, module in self.modules:
+            key = f"{self.seed}:{step}:{microbatch}:{lane}:{fqn}".encode()
+            sample_seed = int.from_bytes(
+                hashlib.blake2b(key, digest_size=8).digest(), "little"
+            )
+            generator = torch.Generator(device="cpu").manual_seed(sample_seed)
+            signs = torch.randint(
+                0, 2, (_NVFP4_BLOCK,), dtype=torch.int8, generator=generator
+            ).mul_(2).sub_(1)
+            target = getattr(module, buffer_name)
+            if isinstance(target, DTensor):
+                target = target.to_local()
+            target.copy_(signs.to(target.device))
+
+    def refresh_dgrad(self, step: int) -> None:
+        self._refresh(
+            lane="dgrad", step=step, microbatch=0, buffer_name="_dgrad_rht"
+        )
+
+    def refresh_wgrad(self, step: int, microbatch: int) -> None:
+        self._refresh(
+            lane="wgrad",
+            step=step,
+            microbatch=microbatch,
+            buffer_name="_wgrad_rht",
+        )
+
 
 try:
     from kernels import (
@@ -87,36 +136,25 @@ try:
             super().__init__(config)
             # Persistent for native V2 checkpoint/resume. Start as None so
             # to_empty() leaves them alone; materialized in _init_self_buffers().
-            self.register_buffer("_rht_sign_vector", None, persistent=True)
+            self.register_buffer("_wgrad_rht", None, persistent=True)
+            self.register_buffer("_dgrad_rht", None, persistent=True)
             self.register_buffer("_row_seed", None, persistent=True)
             self.register_buffer("_col_seed", None, persistent=True)
-            # NVFP4LinearV2.apply takes the sign vector as a python list[int]; cache.
-            self._sign_vector_list: list[int] | None = None
             # Tensor-parallel wiring: set by NVFP4{Colwise,Rowwise}ParallelV2._apply.
             # process_group=None keeps forward on the single-GPU / FSDP path.
             self.process_group = None
             self.world_size = 1
             self.tensor_parallel_style = None
 
-        def _refresh_sign_vector_list(self) -> None:
-            sv = self._rht_sign_vector
-            self._sign_vector_list = (
-                None if sv is None else sv.reshape(-1).int().tolist()
-            )
-
-        def _load_from_state_dict(self, *args, **kwargs):
-            super()._load_from_state_dict(*args, **kwargs)
-            self._refresh_sign_vector_list()
-
         def _init_self_buffers(
             self, *, buffer_device: torch.device | None = None
         ) -> None:
             dev = buffer_device or self.weight.device
-            # 128-element ±1 RHT sign vector, shared by forward and backward so the
-            # RHT rotations cancel. Deterministic in the length, kept as int8.
-            self._rht_sign_vector = sign_vector_for(_NVFP4_BLOCK).to(
+            initial_rht = sign_vector_for(_NVFP4_BLOCK).to(
                 device=dev, dtype=torch.int8
             )
+            self._wgrad_rht = initial_rht.clone()
+            self._dgrad_rht = initial_rht.clone()
             # Fixed per-module SR seeds; offsets are drawn fresh each forward.
             self._row_seed = torch.randint(
                 -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=dev
@@ -124,7 +162,6 @@ try:
             self._col_seed = torch.randint(
                 -(2**63), 2**63 - 1, (1,), dtype=torch.int64, device=dev
             )
-            self._refresh_sign_vector_list()
 
         def forward(self, input: torch.Tensor) -> torch.Tensor:
             # weight and input are plain local tensors: FSDP all-gathers the weight
@@ -140,6 +177,16 @@ try:
             x_2d = x.reshape(-1, x.shape[-1])
             if x_2d.dtype != torch.bfloat16:
                 x_2d = x_2d.to(torch.bfloat16)
+            wgrad_rht = (
+                self._wgrad_rht.to_local()
+                if isinstance(self._wgrad_rht, DTensor)
+                else self._wgrad_rht
+            )
+            dgrad_rht = (
+                self._dgrad_rht.to_local()
+                if isinstance(self._dgrad_rht, DTensor)
+                else self._dgrad_rht
+            )
 
             if self.process_group is not None:
                 # Tensor-parallel: fp4 collectives run inside the autograd function.
@@ -153,7 +200,8 @@ try:
                         col_seed=self._col_seed,
                         tp_group=self.process_group,
                         world_size=self.world_size,
-                        sign_vector=self._sign_vector_list,
+                        wgrad_rht=wgrad_rht,
+                        dgrad_rht=dgrad_rht,
                     )
                 elif self.tensor_parallel_style == _TP_STYLE_ROWWISE:
                     out_2d = nvfp4_row_parallel_linear_v2(
@@ -164,7 +212,8 @@ try:
                         col_seed=self._col_seed,
                         tp_group=self.process_group,
                         world_size=self.world_size,
-                        sign_vector=self._sign_vector_list,
+                        wgrad_rht=wgrad_rht,
+                        dgrad_rht=dgrad_rht,
                     )
                 else:
                     raise ValueError(
@@ -184,7 +233,8 @@ try:
                 out_2d = NVFP4LinearV2.apply(
                     x_2d,
                     weight,
-                    self._sign_vector_list,
+                    wgrad_rht,
+                    dgrad_rht,
                     self._row_seed,
                     row_offset,
                     self._col_seed,
