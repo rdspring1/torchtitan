@@ -43,6 +43,7 @@ from .mx import (  # noqa: F401, E402
     MXFP8LinearConverter,
 )
 from .nvfp4 import NVFP4Linear, NVFP4LinearConverter  # noqa: F401, E402
+from .nvfp4_v2 import NVFP4LinearV2Converter, NVFP4LinearV2Linear  # noqa: F401, E402
 
 __all__ = [
     "Float8GroupedExpertsConverter",
@@ -53,5 +54,7 @@ __all__ = [
     "MXFP8LinearConverter",
     "NVFP4Linear",
     "NVFP4LinearConverter",
+    "NVFP4LinearV2Converter",
+    "NVFP4LinearV2Linear",
     "QuantizationConverter",
 ]

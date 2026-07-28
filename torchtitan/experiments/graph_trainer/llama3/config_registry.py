@@ -15,7 +15,11 @@ from torchtitan.models.llama3.config_registry import (
     llama3_405b,
     llama3_70b,
     llama3_8b,
+    llama3_8b_nvfp4_v2,
+    llama3_8b_nvfp4_v2_mixed,
     llama3_debugmodel,
+    llama3_debugmodel_nvfp4_v2,
+    llama3_debugmodel_nvfp4_v2_mixed,
 )
 
 from . import model_registry
@@ -81,5 +85,31 @@ def graph_trainer_llama3_70b() -> GraphTrainer.Config:
 
 def graph_trainer_llama3_405b() -> GraphTrainer.Config:
     config = to_graph_trainer_config(llama3_405b(), model_registry)
+    config.compile = GraphTrainerCompileConfig(enable=True)
+    return config
+
+
+def graph_trainer_llama3_debugmodel_nvfp4_v2() -> GraphTrainer.Config:
+    config = to_graph_trainer_config(llama3_debugmodel_nvfp4_v2(), model_registry)
+    config.compile = GraphTrainerCompileConfig(enable=True)
+    return config
+
+
+def graph_trainer_llama3_debugmodel_nvfp4_v2_mixed() -> GraphTrainer.Config:
+    config = to_graph_trainer_config(
+        llama3_debugmodel_nvfp4_v2_mixed(), model_registry
+    )
+    config.compile = GraphTrainerCompileConfig(enable=True)
+    return config
+
+
+def graph_trainer_llama3_8b_nvfp4_v2() -> GraphTrainer.Config:
+    config = to_graph_trainer_config(llama3_8b_nvfp4_v2(), model_registry)
+    config.compile = GraphTrainerCompileConfig(enable=True)
+    return config
+
+
+def graph_trainer_llama3_8b_nvfp4_v2_mixed() -> GraphTrainer.Config:
+    config = to_graph_trainer_config(llama3_8b_nvfp4_v2_mixed(), model_registry)
     config.compile = GraphTrainerCompileConfig(enable=True)
     return config

@@ -12,6 +12,7 @@ from torchtitan.components.optimizer import default_adamw
 from torchtitan.components.quantization import (
     Float8LinearConverter,
     NVFP4LinearConverter,
+    NVFP4LinearV2Converter,
 )
 from torchtitan.components.quantization.nvfp4 import (
     _NVFP4_BF16_TAIL_FRACTION,
@@ -131,6 +132,47 @@ def llama3_debugmodel_nvfp4_mixed() -> Trainer.Config:
     return config
 
 
+def llama3_debugmodel_nvfp4_v2() -> Trainer.Config:
+    config = llama3_debugmodel()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    # fqns=["layers"] converts every in-layer Linear (attention + feed_forward)
+    # while leaving the lm_head stock: NVFP4 requires each GEMM dim divisible by
+    # 128, which the vocab projection does not satisfy.
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            NVFP4LinearV2Converter.Config(
+                fqns=["layers"],
+                model_compile_enabled=model_compile_enabled,
+            ),
+        ],
+    )
+    return config
+
+
+def llama3_debugmodel_nvfp4_v2_mixed() -> Trainer.Config:
+    config = llama3_debugmodel()
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    # Mixed precision: convert the leading decoder layers to NVFP4 V2 and keep the
+    # last _NVFP4_BF16_TAIL_FRACTION of layers (plus the lm_head) in bf16.
+    n_layers = len(config.model_spec.model.layers)
+    fqns = nvfp4_bf16_tail_fqns(n_layers, _NVFP4_BF16_TAIL_FRACTION)
+    config.model_spec = model_registry(
+        "debugmodel",
+        converters=[
+            NVFP4LinearV2Converter.Config(
+                fqns=fqns,
+                model_compile_enabled=model_compile_enabled,
+            ),
+        ],
+    )
+    return config
+
+
 def llama3_debugmodel_float8_emulate_lora() -> Trainer.Config:
     from torchtitan.components.lora import LoRAConverter
 
@@ -225,6 +267,44 @@ def llama3_8b_nvfp4_mixed() -> Trainer.Config:
         "8B",
         converters=[
             NVFP4LinearConverter.Config(
+                fqns=fqns,
+                model_compile_enabled=True,
+            ),
+        ],
+    )
+    return config
+
+
+def llama3_8b_nvfp4_v2() -> Trainer.Config:
+    config = llama3_8b()
+    # Enable compile so NVFP4's dynamic quantization runs at competitive perf.
+    config.compile = CompileConfig(enable=True, components=["model"])
+    # fqns=["layers"] converts every in-layer Linear while leaving the lm_head
+    # stock (NVFP4 requires each GEMM dim divisible by 128; vocab does not).
+    config.model_spec = model_registry(
+        "8B",
+        converters=[
+            NVFP4LinearV2Converter.Config(
+                fqns=["layers"],
+                model_compile_enabled=True,
+            ),
+        ],
+    )
+    return config
+
+
+def llama3_8b_nvfp4_v2_mixed() -> Trainer.Config:
+    config = llama3_8b()
+    # Enable compile so NVFP4's dynamic quantization runs at competitive perf.
+    config.compile = CompileConfig(enable=True, components=["model"])
+    # Mixed precision: convert the leading decoder layers to NVFP4 V2 and keep the
+    # last _NVFP4_BF16_TAIL_FRACTION of layers (plus the lm_head) in bf16.
+    n_layers = len(config.model_spec.model.layers)
+    fqns = nvfp4_bf16_tail_fqns(n_layers, _NVFP4_BF16_TAIL_FRACTION)
+    config.model_spec = model_registry(
+        "8B",
+        converters=[
+            NVFP4LinearV2Converter.Config(
                 fqns=fqns,
                 model_compile_enabled=True,
             ),
