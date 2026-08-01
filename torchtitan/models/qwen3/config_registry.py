@@ -13,7 +13,7 @@ from torchtitan.components.optimizer import (
     OptimizersContainer,
     ParamGroupConfig,
 )
-from torchtitan.components.quantization import NVFP4LinearConverter
+from torchtitan.components.quantization import MXFP8LinearConverter, NVFP4LinearConverter
 from torchtitan.components.quantization.nvfp4 import (
     _NVFP4_BF16_TAIL_FRACTION,
     nvfp4_bf16_tail_fqns,
@@ -248,6 +248,24 @@ def qwen3_8b_nvfp4_mixed() -> Trainer.Config:
         converters=[
             NVFP4LinearConverter.Config(
                 fqns=fqns,
+                model_compile_enabled=True,
+            ),
+        ],
+    )
+    return config
+
+
+def qwen3_8b_mxfp8() -> Trainer.Config:
+    """Qwen3-8B GSM8K SFT with MXFP8 decoder-layer linears."""
+
+    config = sft_qwen3_8b_math()
+    config.compile = CompileConfig(enable=True, components=["model"])
+    config.model_spec = model_registry(
+        "8B",
+        attn_backend="varlen",
+        converters=[
+            MXFP8LinearConverter.Config(
+                fqns=["layers"],
                 model_compile_enabled=True,
             ),
         ],

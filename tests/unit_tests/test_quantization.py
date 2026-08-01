@@ -9,7 +9,10 @@ import torch
 
 from torchtitan.components.quantization import Float8Linear
 from torchtitan.components.quantization.float8 import _get_float8_grouped_experts_cls
-from torchtitan.components.quantization.mx import _get_mxfp8_grouped_experts_cls
+from torchtitan.components.quantization.mx import (
+    MXFP8Linear,
+    _get_mxfp8_grouped_experts_cls,
+)
 from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.config import ConfigManager
 from torchtitan.models.common.decoder_sharding import colwise_config, rowwise_config
@@ -108,6 +111,32 @@ def test_nvfp4_bf16_tail_fqns():
     # (an empty fqns list would instead convert *all* Linears).
     with pytest.raises(ValueError, match="nothing to convert"):
         nvfp4_bf16_tail_fqns(4, 1.0)
+
+
+def test_qwen3_8b_mxfp8_recipe_converts_decoder_layers(monkeypatch):
+    pytest.importorskip("torchao")
+    if MXFP8Linear is None:
+        pytest.skip("torchao MXFP8 training prototype not available")
+
+    import torchtitan.components.quantization.mx as mx_mod
+
+    monkeypatch.setattr(mx_mod, "has_cuda_capability", lambda *_: True)
+    config = ConfigManager().parse_args(
+        ["--module", "qwen3", "--config", "qwen3_8b_mxfp8"]
+    )
+
+    assert config.dataloader.dataset_path == "openai/gsm8k"
+    assert config.checkpoint.initial_load_in_hf
+    assert config.compile.enable
+    assert "model" in config.compile.components
+
+    converted, stock = [], []
+    for fqn, linear, _parent, _attr in config.model_spec.model.traverse(Linear.Config):
+        (converted if isinstance(linear, MXFP8Linear.Config) else stock).append(fqn)
+
+    assert converted and all(fqn.startswith("layers.") for fqn in converted)
+    assert {int(fqn.split(".")[1]) for fqn in converted} == set(range(36))
+    assert stock == ["lm_head"]
 
 
 @pytest.mark.parametrize(
