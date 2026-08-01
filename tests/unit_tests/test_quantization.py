@@ -140,16 +140,17 @@ def test_qwen3_8b_mxfp8_recipe_converts_decoder_layers(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "module, recipe, expected_cutoff",
+    "module, recipe, bf16_tail_fraction, expected_cutoff",
     [
-        ("llama3", "llama3_debugmodel_nvfp4_mixed", 5),
-        ("llama3", "llama3_8b_nvfp4_mixed", 27),
-        ("qwen3", "qwen3_debugmodel_nvfp4_mixed", 6),
-        ("qwen3", "qwen3_8b_nvfp4_mixed", 30),
+        ("llama3", "llama3_debugmodel_nvfp4_mixed", 0.15, 5),
+        ("llama3", "llama3_8b_nvfp4_mixed", 0.15, 27),
+        ("qwen3", "qwen3_debugmodel_nvfp4_mixed", 0.15, 6),
+        ("qwen3", "qwen3_8b_nvfp4_mixed", 0.15, 30),
+        ("qwen3", "qwen3_8b_nvfp4_mixed_30", 0.30, 25),
     ],
 )
 def test_nvfp4_mixed_converts_only_leading_layers(
-    monkeypatch, module, recipe, expected_cutoff
+    monkeypatch, module, recipe, bf16_tail_fraction, expected_cutoff
 ):
     pytest.importorskip("torchao")
     from torchtitan.components.quantization import NVFP4Linear
@@ -165,7 +166,7 @@ def test_nvfp4_mixed_converts_only_leading_layers(
     config = ConfigManager().parse_args(["--module", module, "--config", recipe])
     model_config = config.model_spec.model
     n_layers = len(model_config.layers)
-    cutoff = n_layers - math.ceil(n_layers * nvfp4_mod._NVFP4_BF16_TAIL_FRACTION)
+    cutoff = n_layers - math.ceil(n_layers * bf16_tail_fraction)
     assert cutoff == expected_cutoff
     assert 0 < cutoff < n_layers  # a real split: some NVFP4, some bf16
 

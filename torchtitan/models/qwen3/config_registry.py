@@ -231,16 +231,15 @@ def qwen3_1_7b() -> Trainer.Config:
     )
 
 
-def qwen3_8b_nvfp4_mixed() -> Trainer.Config:
+def _qwen3_8b_nvfp4_mixed(bf16_tail_fraction: float) -> Trainer.Config:
     config = sft_qwen3_8b_math()
     config.parallelism.spmd_backend = "spmd_types"
     assert config.model_spec is not None
     config.compile = CompileConfig(enable=True, components=["model"])
-    # Keep the last 15% of decoder layers and the lm_head in bf16.
     num_layers = len(config.model_spec.model.layers)
     fqns = nvfp4_bf16_tail_fqns(
         num_layers,
-        _NVFP4_BF16_TAIL_FRACTION,
+        bf16_tail_fraction,
     )
     config.model_spec = model_registry(
         "8B",
@@ -253,6 +252,18 @@ def qwen3_8b_nvfp4_mixed() -> Trainer.Config:
         ],
     )
     return config
+
+
+def qwen3_8b_nvfp4_mixed() -> Trainer.Config:
+    """Qwen3-8B SFT with a 15% bf16 decoder-layer tail."""
+
+    return _qwen3_8b_nvfp4_mixed(_NVFP4_BF16_TAIL_FRACTION)
+
+
+def qwen3_8b_nvfp4_mixed_30() -> Trainer.Config:
+    """Qwen3-8B SFT ablation with a 30% bf16 decoder-layer tail."""
+
+    return _qwen3_8b_nvfp4_mixed(0.30)
 
 
 def qwen3_8b_mxfp8() -> Trainer.Config:
