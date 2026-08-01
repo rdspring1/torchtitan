@@ -140,6 +140,29 @@ def test_qwen3_8b_mxfp8_recipe_converts_decoder_layers(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "recipe, initial_load_in_hf",
+    [
+        ("qwen3_8b_pretrain", False),
+        ("qwen3_8b_pretrain_mxfp8", False),
+        ("qwen3_8b_pretrain_nvfp4_mixed", False),
+        ("qwen3_8b_continue_pretrain", True),
+        ("qwen3_8b_continue_pretrain_mxfp8", True),
+        ("qwen3_8b_continue_pretrain_nvfp4_mixed", True),
+    ],
+)
+def test_qwen3_8b_pretraining_recipes(recipe, initial_load_in_hf):
+    config = ConfigManager().parse_args(["--module", "qwen3", "--config", recipe])
+
+    assert config.dataloader.dataset == "c4"
+    assert config.checkpoint.initial_load_in_hf is initial_load_in_hf
+    assert config.compile.enable
+    assert "model" in config.compile.components
+    assert config.training.local_batch_size == 16
+    assert config.training.seq_len == 2048
+    assert config.training.steps == 1526
+
+
+@pytest.mark.parametrize(
     "module, recipe, bf16_tail_fraction, expected_cutoff",
     [
         ("llama3", "llama3_debugmodel_nvfp4_mixed", 0.15, 5),
@@ -147,6 +170,8 @@ def test_qwen3_8b_mxfp8_recipe_converts_decoder_layers(monkeypatch):
         ("qwen3", "qwen3_debugmodel_nvfp4_mixed", 0.15, 6),
         ("qwen3", "qwen3_8b_nvfp4_mixed", 0.15, 30),
         ("qwen3", "qwen3_8b_nvfp4_mixed_30", 0.30, 25),
+        ("qwen3", "qwen3_8b_pretrain_nvfp4_mixed", 0.15, 30),
+        ("qwen3", "qwen3_8b_continue_pretrain_nvfp4_mixed", 0.15, 30),
     ],
 )
 def test_nvfp4_mixed_converts_only_leading_layers(

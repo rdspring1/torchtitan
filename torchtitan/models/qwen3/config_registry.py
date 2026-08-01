@@ -231,6 +231,95 @@ def qwen3_1_7b() -> Trainer.Config:
     )
 
 
+def _qwen3_8b_pretrain(initial_load_in_hf: bool) -> Trainer.Config:
+    model_spec = model_registry("8B")
+    return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
+        hf_assets_path="./assets/hf/Qwen3-8B",
+        model_spec=model_spec,
+        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
+        optimizer=default_adamw(lr=2e-5 if initial_load_in_hf else 3e-4),
+        training=TrainingConfig(local_batch_size=16, seq_len=2048, steps=1526),
+        checkpoint=CheckpointManager.Config(initial_load_in_hf=initial_load_in_hf),
+        activation_checkpoint=SelectiveAC.Config(),
+        compile=CompileConfig(enable=True, components=["model"]),
+    )
+
+
+def qwen3_8b_pretrain() -> Trainer.Config:
+    """Qwen3-8B random-initialized C4 pretraining."""
+
+    return _qwen3_8b_pretrain(initial_load_in_hf=False)
+
+
+def qwen3_8b_continue_pretrain() -> Trainer.Config:
+    """Qwen3-8B C4 continued pretraining from local HF weights."""
+
+    return _qwen3_8b_pretrain(initial_load_in_hf=True)
+
+
+def _qwen3_8b_pretrain_nvfp4_mixed(initial_load_in_hf: bool) -> Trainer.Config:
+    config = _qwen3_8b_pretrain(initial_load_in_hf)
+    config.parallelism.spmd_backend = "spmd_types"
+    assert config.model_spec is not None
+    num_layers = len(config.model_spec.model.layers)
+    config.model_spec = model_registry(
+        "8B",
+        converters=[
+            NVFP4LinearConverter.Config(
+                fqns=nvfp4_bf16_tail_fqns(
+                    num_layers,
+                    _NVFP4_BF16_TAIL_FRACTION,
+                ),
+                model_compile_enabled=True,
+            ),
+        ],
+    )
+    return config
+
+
+def qwen3_8b_pretrain_nvfp4_mixed() -> Trainer.Config:
+    """Random-initialized C4 pretraining with a 15% bf16 tail."""
+
+    return _qwen3_8b_pretrain_nvfp4_mixed(initial_load_in_hf=False)
+
+
+def qwen3_8b_continue_pretrain_nvfp4_mixed() -> Trainer.Config:
+    """HF-initialized C4 pretraining with a 15% bf16 tail."""
+
+    return _qwen3_8b_pretrain_nvfp4_mixed(initial_load_in_hf=True)
+
+
+def _qwen3_8b_pretrain_mxfp8(initial_load_in_hf: bool) -> Trainer.Config:
+    config = _qwen3_8b_pretrain(initial_load_in_hf)
+    config.model_spec = model_registry(
+        "8B",
+        converters=[
+            MXFP8LinearConverter.Config(
+                fqns=["layers"],
+                model_compile_enabled=True,
+            ),
+        ],
+    )
+    return config
+
+
+def qwen3_8b_pretrain_mxfp8() -> Trainer.Config:
+    """Random-initialized C4 pretraining with MXFP8 decoder linears."""
+
+    return _qwen3_8b_pretrain_mxfp8(initial_load_in_hf=False)
+
+
+def qwen3_8b_continue_pretrain_mxfp8() -> Trainer.Config:
+    """HF-initialized C4 pretraining with MXFP8 decoder linears."""
+
+    return _qwen3_8b_pretrain_mxfp8(initial_load_in_hf=True)
+
+
 def _qwen3_8b_nvfp4_mixed(bf16_tail_fraction: float) -> Trainer.Config:
     config = sft_qwen3_8b_math()
     config.parallelism.spmd_backend = "spmd_types"
