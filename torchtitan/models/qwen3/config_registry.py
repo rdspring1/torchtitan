@@ -244,7 +244,10 @@ def _qwen3_8b_pretrain(initial_load_in_hf: bool) -> Trainer.Config:
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4"),
         optimizer=default_adamw(lr=2e-5 if initial_load_in_hf else 3e-4),
         training=TrainingConfig(local_batch_size=16, seq_len=2048, steps=1526),
-        checkpoint=CheckpointManager.Config(initial_load_in_hf=initial_load_in_hf),
+        checkpoint=CheckpointManager.Config(
+            enable=initial_load_in_hf,
+            initial_load_in_hf=initial_load_in_hf,
+        ),
         activation_checkpoint=SelectiveAC.Config(),
         compile=CompileConfig(enable=True, components=["model"]),
     )

@@ -155,6 +155,7 @@ def test_qwen3_8b_pretraining_recipes(recipe, initial_load_in_hf):
 
     assert config.dataloader.dataset == "c4"
     assert config.checkpoint.initial_load_in_hf is initial_load_in_hf
+    assert config.checkpoint.enable is initial_load_in_hf
     assert config.compile.enable
     assert "model" in config.compile.components
     assert config.training.local_batch_size == 16
