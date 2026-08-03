@@ -336,6 +336,10 @@ def test_nvfp4_hf_export_strips_buffers(monkeypatch):
 
 def test_quantized_grouped_experts():
     """Quantized GroupedExperts: _owner, subclass handling, extra config fields."""
+    pytest.importorskip("torchao")
+    from torchtitan.components.quantization import NVFP4Linear
+    from torchtitan.components.quantization.nvfp4 import _get_nvfp4_grouped_experts_cls
+
     # Base case
     MXFP8GroupedExperts = _get_mxfp8_grouped_experts_cls(GroupedExperts)
     Float8GroupedExperts = _get_float8_grouped_experts_cls(GroupedExperts)
@@ -353,3 +357,65 @@ def test_quantized_grouped_experts():
     assert issubclass(float8_cls, GptOssGroupedExperts)
     assert hasattr(mxfp8_cls.Config, "swiglu_limit")
     assert hasattr(float8_cls.Config, "swiglu_limit")
+
+    # NVFP4 mirrors the MXFP8/Float8 pattern: _owner is wired, the subclass
+    # overrides _grouped_mm, and it works for GptOssGroupedExperts too. Skip if
+    # the torchao NVFP4 training prototype is unavailable.
+    if NVFP4Linear is None:
+        pytest.skip("torchao NVFP4 training prototype not available")
+    nvfp4_cls = _get_nvfp4_grouped_experts_cls(GroupedExperts)
+    assert nvfp4_cls.Config._owner is nvfp4_cls
+    assert issubclass(nvfp4_cls, GroupedExperts)
+    assert nvfp4_cls._grouped_mm is not GroupedExperts._grouped_mm
+    # Cached: repeated calls return the same class.
+    assert _get_nvfp4_grouped_experts_cls(GroupedExperts) is nvfp4_cls
+
+    nvfp4_gptoss_cls = _get_nvfp4_grouped_experts_cls(GptOssGroupedExperts)
+    assert nvfp4_gptoss_cls.Config._owner is nvfp4_gptoss_cls
+    assert issubclass(nvfp4_gptoss_cls, GptOssGroupedExperts)
+    assert hasattr(nvfp4_gptoss_cls.Config, "swiglu_limit")
+
+
+def test_nvfp4_grouped_experts_converter_targets_leading_moe_layers(monkeypatch):
+    """The DSV3 NVFP4 recipe swaps only the leading-85% MoE layers' experts to the
+    NVFP4 subclass and swaps their dispatcher to TorchAOTokenDispatcher(pad=128);
+    the bf16-tail MoE layer keeps stock GroupedExperts and its original dispatcher.
+    """
+    pytest.importorskip("torchao")
+    from torchtitan.components.quantization import NVFP4Linear
+    from torchtitan.components.quantization.nvfp4 import _get_nvfp4_grouped_experts_cls
+    from torchtitan.models.common.token_dispatcher import TorchAOTokenDispatcher
+
+    if NVFP4Linear is None:
+        pytest.skip("torchao NVFP4 training prototype not available")
+    # Config-tree transform is GPU-independent: bypass the sm100 gate the
+    # converter __init__ enforces.
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+
+    config_manager = ConfigManager()
+    config = config_manager.parse_args(
+        ["--module", "deepseek_v3", "--config", "deepseek_v3_debugmodel_nvfp4"]
+    )
+    model_config = config.model_spec.model
+    assert has_quantization(model_config)
+
+    NVFP4Experts = _get_nvfp4_grouped_experts_cls(GroupedExperts)
+    converted, stock = [], []
+    for fqn, cfg, parent, _attr in model_config.traverse(GroupedExperts.Config):
+        if isinstance(cfg, NVFP4Experts.Config):
+            converted.append(fqn)
+            # The sibling dispatcher was swapped to the padded TorchAO variant.
+            assert isinstance(parent.token_dispatcher, TorchAOTokenDispatcher.Config)
+            assert parent.token_dispatcher.pad_multiple == 128
+        else:
+            stock.append(fqn)
+            assert not isinstance(
+                parent.token_dispatcher, TorchAOTokenDispatcher.Config
+            )
+
+    # debugmodel: 6 layers, 1 dense -> MoE in layers 1..5; 15% tail keeps layer 5
+    # in bf16, so layers 1..4 convert.
+    assert {int(fqn.split(".")[1]) for fqn in converted} == {1, 2, 3, 4}
+    assert {int(fqn.split(".")[1]) for fqn in stock} == {5}

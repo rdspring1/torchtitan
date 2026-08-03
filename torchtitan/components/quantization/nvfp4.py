@@ -17,7 +17,7 @@ reduce-scatter); NVFP4 does not move fp4 codes over the wire.
 """
 
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from typing import cast
 
 import spmd_types as spmd
@@ -27,10 +27,13 @@ from torchtitan.components.quantization import QuantizationConverter
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.models.common.decoder_sharding import dense_activation_placement
 from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import LocalMapConfig, SpmdLayout
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import has_cuda_capability
+
+from .utils import swap_token_dispatcher
 
 TP = MeshAxisName.TP
 
@@ -64,6 +67,9 @@ _HARDCODED_SIGN_VECTOR = (
 )
 
 try:
+    from torchao.prototype.moe_training.nvfp4_training.nvfp4_grouped_mm import (
+        _to_nvfp4_rht_rs_then_scaled_grouped_mm,
+    )
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_linear import (
         nvfp4_linear,
         nvfp4_mm_triton,
@@ -312,4 +318,174 @@ class NVFP4LinearConverter(QuantizationConverter):
                     setattr(parent, attr, new_config)
 
         logger.info("Converted Linear layers to NVFP4Linear")
+        return model_config
+
+
+_nvfp4_experts_cache: dict[type, type] = {}
+
+
+def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
+    """Get or create an NVFP4-quantized subclass of *parent_cls*.
+
+    Works for any experts module exposing the ``_grouped_mm`` seam (the common
+    ``GroupedExperts`` and ``GptOssGroupedExperts``). The returned class has a
+    proper ``_owner`` set by ``__init_subclass__``.
+
+    The subclass overrides ``_grouped_mm`` to call torchao's
+    ``_to_nvfp4_then_scaled_grouped_mm``. It carries the same runtime NVFP4 state
+    as :class:`NVFP4Linear` -- a per-rank ``_sr_seed`` and the fixed
+    ``_HARDCODED_SIGN_VECTOR`` -- as non-persistent buffers materialized per rank
+    in ``_init_self_buffers`` (see NVFP4Linear for why neither is checkpointed).
+    """
+    if parent_cls in _nvfp4_experts_cache:
+        return _nvfp4_experts_cache[parent_cls]
+
+    parent_config_cls = parent_cls.Config  # type: ignore[attr-defined]
+
+    class NVFP4GroupedExperts(parent_cls):  # type: ignore[valid-type, misc]
+        @dataclass(kw_only=True, slots=True)
+        class Config(parent_config_cls):  # type: ignore[misc]
+            pass
+
+        def __init__(self, config: Config):
+            super().__init__(config)
+            # Same buffer protocol as NVFP4Linear.__init__: register the runtime
+            # buffers as None so _distribute_states skips them and
+            # _init_self_buffers materializes them per rank on the real device.
+            self.register_buffer("_sr_seed", None, persistent=False)
+            self.register_buffer("_rht_sign_vector", None, persistent=False)
+            self._rht_sign_vector_tuple = None
+
+        def _local_rht_sign_vector(self) -> torch.Tensor:
+            sign_vector = self._rht_sign_vector
+            if sign_vector is not None and sign_vector.device.type != "meta":
+                sign_vector = sign_vector.reshape(-1)
+            return sign_vector
+
+        def _refresh_rht_sign_vector_tuple(self) -> None:
+            sign_vector = self._local_rht_sign_vector()
+            self._rht_sign_vector_tuple = (
+                None if sign_vector is None else _rht_sign_vector_to_tuple(sign_vector)
+            )
+
+        def _load_from_state_dict(self, *args, **kwargs):
+            super()._load_from_state_dict(*args, **kwargs)
+            self._refresh_rht_sign_vector_tuple()
+
+        @property
+        def rht_sign_vector(self) -> tuple[int, ...]:
+            if self._rht_sign_vector_tuple is None:
+                self._refresh_rht_sign_vector_tuple()
+            if self._rht_sign_vector_tuple is None:
+                raise RuntimeError("rht_sign_vector is not materialized")
+            return self._rht_sign_vector_tuple
+
+        def _init_self_buffers(
+            self, *, buffer_device: torch.device | None = None
+        ) -> None:
+            super()._init_self_buffers(buffer_device=buffer_device)
+            dev = (
+                buffer_device
+                if buffer_device is not None
+                else cast(torch.Tensor, self.w1_EFD).device
+            )
+            self._sr_seed = torch.randint(
+                -9_223_372_036_854_775_808,
+                9_223_372_036_854_775_807,
+                (1,),
+                dtype=torch.int64,
+                device=dev,
+            )
+            self._rht_sign_vector = _make_rht_sign_vector(
+                _HARDCODED_SIGN_VECTOR, device=dev
+            )
+            self._refresh_rht_sign_vector_tuple()
+
+        def _grouped_mm(self, *, A, B_t, offs):
+            # torchao's NVFP4 grouped MM takes the un-transposed weight B (E, N, K)
+            # and quantizes the whole activation block, so the final offset must
+            # cover the dispatcher's padding tail (TorchAOTokenDispatcher leaves a
+            # sentinel tail that the per-expert counts exclude). Clone before the
+            # in-place write so the shared per-forward offsets tensor is untouched.
+            offs = offs.clone()
+            offs[-1] = A.shape[0]
+            return _to_nvfp4_rht_rs_then_scaled_grouped_mm(
+                A,
+                B_t.transpose(-2, -1),
+                self.rht_sign_vector,
+                self._sr_seed,
+                offs=offs,
+                pad_token_groups_for_grouped_mm=False,
+            )
+
+    NVFP4GroupedExperts.__name__ = f"NVFP4{parent_cls.__name__}"
+    NVFP4GroupedExperts.__qualname__ = f"NVFP4{parent_cls.__name__}"
+    _nvfp4_experts_cache[parent_cls] = NVFP4GroupedExperts
+    return NVFP4GroupedExperts
+
+
+class NVFP4GroupedExpertsConverter(QuantizationConverter):
+    """Apply NVFP4 quantization to MoE expert grouped GEMMs."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(QuantizationConverter.Config):
+        fqns: list[str] = field(default_factory=list)
+        """
+        List of fully qualified names of experts modules to quantize. Only
+        GroupedExperts.Config entries whose FQN contains a match are converted.
+        If empty, all experts are converted. Pass explicit fqns (e.g. the leading
+        decoder layers) to keep the tail layers' experts in bf16.
+        """
+        pad_multiple: int = 128
+        """
+        Pad per-expert token groups to this multiple for NVFP4 grouped GEMM
+        alignment. TorchAO's NVFP4 Triton kernels require multiples of 128.
+        """
+
+    def __init__(self, config: Config):
+        self.config = config
+
+        # NVFP4Linear is None iff the whole torchao NVFP4 prototype import block
+        # (which also provides _to_nvfp4_then_scaled_grouped_mm used by the seam)
+        # failed, so this is the correct guard rather than a bare find_spec.
+        if NVFP4Linear is None:
+            raise ImportError(
+                "torchao is not installed or does not provide the NVFP4 training "
+                "prototype. Install a torchao build with "
+                "torchao.prototype.moe_training.nvfp4_training."
+            )
+
+        if not has_cuda_capability(10, 0):
+            raise ValueError("NVFP4 is only supported on SM100 or later architectures")
+
+        if not self.config.model_compile_enabled:
+            logger.warning(
+                "torch.compile enablement is required for highest performance "
+                "of NVFP4 dynamic quantization."
+            )
+
+    def convert(self, model_config):
+        fqns = self.config.fqns
+        for fqn, config, parent, attr in model_config.traverse(GroupedExperts.Config):
+            if fqns and not any(target_fqn in fqn for target_fqn in fqns):
+                continue
+            # ``parent`` is the RoutedExperts.Config owning inner_experts + dispatcher.
+            swap_token_dispatcher(parent, self.config.pad_multiple)
+            base_module_cls = type(config)._owner
+            quantized_cls = _get_nvfp4_grouped_experts_cls(base_module_cls)
+            config_cls = quantized_cls.Config  # type: ignore[attr-defined]
+            new_config = config_cls(
+                **{f.name: getattr(config, f.name) for f in fields(config)}
+            )
+            if parent is None:
+                model_config = new_config
+            elif isinstance(parent, list):
+                parent[attr] = new_config
+            else:
+                setattr(parent, attr, new_config)
+
+        logger.info(
+            "Converted GroupedExperts to use dynamic NVFP4 quantization for "
+            "grouped_mm ops"
+        )
         return model_config
