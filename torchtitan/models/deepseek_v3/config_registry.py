@@ -201,6 +201,35 @@ def deepseek_v3_16b_hybridep() -> Trainer.Config:
     return config
 
 
+def deepseek_v3_16b_nvfp4() -> Trainer.Config:
+    config = deepseek_v3_16b()
+    assert config.model_spec is not None
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    # Same recipe as deepseek_v3_debugmodel_nvfp4 at 16B scale: quantize the MoE
+    # expert grouped GEMMs to NVFP4 for the leading decoder layers and keep the
+    # last _NVFP4_BF16_TAIL_FRACTION of layers in bf16. Dense Linear layers stay
+    # bf16 (DSV3's MLA projections have dims not divisible by 128, which NVFP4's
+    # Triton kernels require). pad_multiple=128 is required by the NVFP4
+    # grouped-mm kernel on sm_100.
+    n_layers = len(config.model_spec.model.layers)
+    _NVFP4_BF16_TAIL_FRACTION = 0.15
+    fqns = nvfp4_bf16_tail_fqns(n_layers, _NVFP4_BF16_TAIL_FRACTION)
+    config.model_spec = model_registry(
+        "16B",
+        attn_backend="flex",
+        converters=[
+            NVFP4GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=fqns,
+                pad_multiple=128,
+            ),
+        ],
+    )
+    return config
+
+
 def deepseek_v3_16b_minimal_async_ep() -> Trainer.Config:
     config = deepseek_v3_16b()
     config.model_spec = model_registry(
