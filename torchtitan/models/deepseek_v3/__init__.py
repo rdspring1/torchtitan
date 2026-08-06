@@ -480,9 +480,9 @@ def _671b(
     attn_backend: str,
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
+    n_layers: int = 61,
 ) -> DeepSeekV3Model.Config:
     dim = 7168
-    n_layers = 61
     vocab_size = 129280
     n_heads = 128
     q_lora_rank = 1536
@@ -549,6 +549,7 @@ deepseekv3_configs = {
     "16B": _16b,
     "236B": _236b,
     "671B": _671b,
+    "671B_12_layers": partial(_671b, n_layers=12),
 }
 
 

@@ -288,6 +288,31 @@ def deepseek_v3_671b() -> Trainer.Config:
     )
 
 
+def deepseek_v3_671b_12_layers_nvfp4_mixed() -> Trainer.Config:
+    config = deepseek_v3_671b()
+    assert config.model_spec is not None
+    config.compile = CompileConfig(enable=True, components=["model", "loss"])
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    n_layers = 12
+    fqns = nvfp4_bf16_tail_fqns(n_layers, 0.15)
+    config.model_spec = model_registry(
+        "671B_12_layers",
+        attn_backend="flex",
+        moe_comm_backend="hybridep",
+        non_blocking_capacity_factor=0.0625,
+        converters=[
+            NVFP4GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=fqns,
+                pad_multiple=128,
+            ),
+        ],
+    )
+    return config
+
+
 def deepseek_v3_671b_float8() -> Trainer.Config:
     config = deepseek_v3_671b()
     # Quantize the dense Linear layers and the MoE expert grouped GEMMs to
