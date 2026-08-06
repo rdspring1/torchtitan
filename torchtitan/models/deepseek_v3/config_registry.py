@@ -313,6 +313,36 @@ def deepseek_v3_671b_12_layers_nvfp4_mixed() -> Trainer.Config:
     return config
 
 
+def deepseek_v3_671b_nvfp4_mixed() -> Trainer.Config:
+    config = deepseek_v3_671b()
+    assert config.model_spec is not None
+    config.compile = CompileConfig(enable=True, components=["model", "loss"])
+    model_compile_enabled = (
+        config.compile.enable and "model" in config.compile.components
+    )
+    n_layers = len(config.model_spec.model.layers)
+    fqns = nvfp4_bf16_tail_fqns(n_layers, 0.15)
+    config.model_spec = model_registry(
+        "671B",
+        attn_backend="flex",
+        moe_comm_backend="hybridep",
+        # Sized to exactly the round-robin demand at the nodes-64 layout
+        # (32768 tokens/rank x 64 ep x min(4, 8) x 0.03125 = 262144 rows
+        # = 65536 per local expert, a multiple of 128). Any surplus leaves
+        # slack rows inside the declared expert groups, which the NVFP4
+        # grouped GEMM reads and the wgrad contraction sums over -> NaN.
+        non_blocking_capacity_factor=0.03125,
+        converters=[
+            NVFP4GroupedExpertsConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=fqns,
+                pad_multiple=128,
+            ),
+        ],
+    )
+    return config
+
+
 def deepseek_v3_671b_float8() -> Trainer.Config:
     config = deepseek_v3_671b()
     # Quantize the dense Linear layers and the MoE expert grouped GEMMs to
