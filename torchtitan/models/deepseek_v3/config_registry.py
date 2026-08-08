@@ -326,11 +326,20 @@ def deepseek_v3_671b_nvfp4_mixed() -> Trainer.Config:
         "671B",
         attn_backend="flex",
         moe_comm_backend="hybridep",
-        # Sized to exactly the round-robin demand at the nodes-64 layout
-        # (32768 tokens/rank x 64 ep x min(4, 8) x 0.03125 = 262144 rows
-        # = 65536 per local expert, a multiple of 128). Any surplus leaves
-        # slack rows inside the declared expert groups, which the NVFP4
-        # grouped GEMM reads and the wgrad contraction sums over -> NaN.
+        # Sized to exactly the round-robin demand (32768 tokens/rank x 64 ep
+        # x min(4, 8) x 0.03125 = 262144 rows = 65536 per local expert, a
+        # multiple of 128). Per-rank demand is tokens_per_rank x top_k
+        # independent of ep, so top_k/256 = 0.03125 is the exact fit for any
+        # ep >= 32; it only changes at ep-16, to 0.0625.
+        #
+        # This is a no-waste default, not a fix for a known failure. An earlier
+        # 12-layer run NaN'd at a larger capacity factor and was clean at the
+        # exact fit, but the two runs also built different commits, so the
+        # factor was never isolated -- and the mechanism proposed at the time
+        # (surplus leaving slack rows inside declared expert groups) is
+        # refuted: reported per-expert counts stay at actual padded demand, and
+        # the NVFP4 kernels mask loads against logical_packed_length, so rows
+        # past offs[-1] are never read.
         non_blocking_capacity_factor=0.03125,
         converters=[
             NVFP4GroupedExpertsConverter.Config(
