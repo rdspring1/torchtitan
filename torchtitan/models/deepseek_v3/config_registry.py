@@ -15,6 +15,7 @@ from torchtitan.components.quantization import (
     MXFP8GroupedExpertsConverter,
     MXFP8LinearConverter,
     NVFP4GroupedExpertsConverter,
+    NVFP4LinearConverter,
 )
 from torchtitan.components.quantization.nvfp4 import nvfp4_bf16_tail_fqns
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
@@ -24,6 +25,28 @@ from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.trainer import Trainer
 
 from . import model_registry
+
+# NVFP4 needs every GEMM dim to be a multiple of 128. In DSV3 that admits the
+# dense FeedForward and the MoE shared experts, but not the MLA projections
+# (wkv_a is dim -> kv_lora_rank + qk_rope_head_dim = 576) or the router gate
+# (dim -> num_experts), so the fqns name FFN submodules explicitly rather than
+# whole layers.
+_NVFP4_FFN_SUBMODULES = ("feed_forward.", "moe.shared_experts.")
+# 16B's dense FeedForward is dim=2048 -> dense_hidden_dim=10944, and
+# 10944 % 128 == 64, so NVFP4Linear.Config rejects it. Its one dense layer
+# (layer 0) stays bf16; the MoE layers' shared experts still convert.
+_NVFP4_FFN_SUBMODULES_NO_DENSE = ("moe.shared_experts.",)
+
+
+def _nvfp4_ffn_linear_fqns(
+    layer_fqns: list[str], submodules: tuple[str, ...]
+) -> list[str]:
+    """Cross-product leading-layer prefixes with FFN submodule paths.
+
+    ``layer_fqns`` comes from ``nvfp4_bf16_tail_fqns``, so the bf16 tail is
+    single-sourced with the grouped-experts converter's fqns.
+    """
+    return [f"{layer}{submodule}" for layer in layer_fqns for submodule in submodules]
 
 
 def enable_fused_swiglu(config: Trainer.Config) -> None:
@@ -105,11 +128,12 @@ def deepseek_v3_debugmodel_nvfp4() -> Trainer.Config:
     model_compile_enabled = (
         config.compile.enable and "model" in config.compile.components
     )
-    # Quantize only the MoE expert grouped GEMMs to NVFP4, matching the linear
-    # recipe's mixed-precision policy: convert the leading decoder layers and keep
-    # the last _NVFP4_BF16_TAIL_FRACTION of layers in bf16. The dense Linear
-    # layers stay bf16 -- DSV3's MLA has projections (e.g. wkv_a, out=576) whose
-    # dims are not divisible by 128, which NVFP4's Triton kernels require.
+    # Quantize every FFN GEMM to NVFP4: the MoE expert grouped GEMMs, the MoE
+    # shared experts, and the dense layers' FeedForward. Convert the leading
+    # decoder layers and keep the last _NVFP4_BF16_TAIL_FRACTION of layers in
+    # bf16. Attention stays bf16 everywhere -- DSV3's MLA has projections (e.g.
+    # wkv_a, out=576) whose dims are not divisible by 128, which NVFP4's Triton
+    # kernels require.
     # pad_multiple=128 is required by the NVFP4 grouped-mm kernel on sm_100.
     n_layers = len(config.model_spec.model.layers)
     _NVFP4_BF16_TAIL_FRACTION = 0.15
@@ -117,6 +141,10 @@ def deepseek_v3_debugmodel_nvfp4() -> Trainer.Config:
     config.model_spec = model_registry(
         "debugmodel",
         converters=[
+            NVFP4LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=_nvfp4_ffn_linear_fqns(fqns, _NVFP4_FFN_SUBMODULES),
+            ),
             NVFP4GroupedExpertsConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=fqns,
@@ -207,12 +235,12 @@ def deepseek_v3_16b_nvfp4() -> Trainer.Config:
     model_compile_enabled = (
         config.compile.enable and "model" in config.compile.components
     )
-    # Same recipe as deepseek_v3_debugmodel_nvfp4 at 16B scale: quantize the MoE
-    # expert grouped GEMMs to NVFP4 for the leading decoder layers and keep the
-    # last _NVFP4_BF16_TAIL_FRACTION of layers in bf16. Dense Linear layers stay
-    # bf16 (DSV3's MLA projections have dims not divisible by 128, which NVFP4's
-    # Triton kernels require). pad_multiple=128 is required by the NVFP4
-    # grouped-mm kernel on sm_100.
+    # Same recipe as deepseek_v3_debugmodel_nvfp4 at 16B scale, with one
+    # exception: 16B's dense FeedForward is 2048 -> 10944, and 10944 % 128 == 64,
+    # so it cannot be NVFP4 and layer 0 stays entirely bf16. The MoE layers'
+    # grouped experts and shared experts convert for the leading decoder layers;
+    # the last _NVFP4_BF16_TAIL_FRACTION of layers stays bf16, as does attention.
+    # pad_multiple=128 is required by the NVFP4 grouped-mm kernel on sm_100.
     n_layers = len(config.model_spec.model.layers)
     _NVFP4_BF16_TAIL_FRACTION = 0.15
     fqns = nvfp4_bf16_tail_fqns(n_layers, _NVFP4_BF16_TAIL_FRACTION)
@@ -220,6 +248,10 @@ def deepseek_v3_16b_nvfp4() -> Trainer.Config:
         "16B",
         attn_backend="flex",
         converters=[
+            NVFP4LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=_nvfp4_ffn_linear_fqns(fqns, _NVFP4_FFN_SUBMODULES_NO_DENSE),
+            ),
             NVFP4GroupedExpertsConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=fqns,
@@ -303,6 +335,10 @@ def deepseek_v3_671b_12_layers_nvfp4_mixed() -> Trainer.Config:
         moe_comm_backend="hybridep",
         non_blocking_capacity_factor=0.0625,
         converters=[
+            NVFP4LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=_nvfp4_ffn_linear_fqns(fqns, _NVFP4_FFN_SUBMODULES),
+            ),
             NVFP4GroupedExpertsConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=fqns,
@@ -342,6 +378,10 @@ def deepseek_v3_671b_nvfp4_mixed() -> Trainer.Config:
         # past offs[-1] are never read.
         non_blocking_capacity_factor=0.03125,
         converters=[
+            NVFP4LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=_nvfp4_ffn_linear_fqns(fqns, _NVFP4_FFN_SUBMODULES),
+            ),
             NVFP4GroupedExpertsConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=fqns,

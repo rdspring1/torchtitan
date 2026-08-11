@@ -419,3 +419,49 @@ def test_nvfp4_grouped_experts_converter_targets_leading_moe_layers(monkeypatch)
     # in bf16, so layers 1..4 convert.
     assert {int(fqn.split(".")[1]) for fqn in converted} == {1, 2, 3, 4}
     assert {int(fqn.split(".")[1]) for fqn in stock} == {5}
+
+    # The same recipe converts every FFN Linear in those layers -- the dense
+    # layer's FeedForward and the MoE shared experts -- and nothing else. An
+    # exact set catches both over-matching (attention or router.gate, whose dims
+    # are not 128-divisible) and under-matching (the whole-layer fqns leaking in).
+    converted_linear = {
+        fqn
+        for fqn, lc, _parent, _attr in model_config.traverse(Linear.Config)
+        if isinstance(lc, NVFP4Linear.Config)
+    }
+    assert converted_linear == {
+        f"layers.0.feed_forward.{w}" for w in ("w1", "w2", "w3")
+    } | {
+        f"layers.{i}.moe.shared_experts.{w}"
+        for i in (1, 2, 3, 4)
+        for w in ("w1", "w2", "w3")
+    }
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        "deepseek_v3_debugmodel_nvfp4",
+        "deepseek_v3_16b_nvfp4",
+        "deepseek_v3_671b_12_layers_nvfp4_mixed",
+        "deepseek_v3_671b_nvfp4_mixed",
+    ],
+)
+def test_deepseek_v3_nvfp4_recipes_resolve(monkeypatch, recipe):
+    """Every DSV3 NVFP4 flavor builds its config tree.
+
+    The failure mode is NVFP4Linear.Config's ``% 128`` rejection: the FFN fqns
+    are per-flavor because 16B's dense FeedForward (2048 -> 10944) cannot be
+    NVFP4. Without this, a mismatch only surfaces at launch time.
+    """
+    pytest.importorskip("torchao")
+    from torchtitan.components.quantization import NVFP4Linear
+
+    if NVFP4Linear is None:
+        pytest.skip("torchao NVFP4 training prototype not available")
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    config = ConfigManager().parse_args(["--module", "deepseek_v3", "--config", recipe])
+    assert config.model_spec.name == "deepseek_v3"
+    assert has_quantization(config.model_spec.model)
