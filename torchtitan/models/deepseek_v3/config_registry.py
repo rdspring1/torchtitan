@@ -387,6 +387,25 @@ def deepseek_v3_671b_nvfp4_mixed() -> Trainer.Config:
                 fqns=fqns,
                 pad_multiple=128,
             ),
+            # Attention in MXFP8, not NVFP4. The shapes would permit NVFP4 --
+            # wq_a 7168->1536, wq_b 1536->24576 and wo 16384->7168 are all
+            # 128-divisible; only wkv_a (7168->576) is not -- but the NVFP4
+            # recipe is not the right instrument for attention, so the format is
+            # chosen per module rather than per shape. This is what makes the
+            # flavor name "mixed" literal.
+            #
+            # Bare fqns, no leading-layer prefix, so this matches the fqns of
+            # deepseek_v3_671b_mxfp8_exp exactly and covers all layers including
+            # the bf16 tail. Deliberate: it gives module-level coverage parity
+            # with the MXFP8 baseline, so a throughput comparison against it
+            # isolates NVFP4-vs-MXFP8 on the FFN and expert GEMMs instead of
+            # measuring how much of the model each flavor happens to convert.
+            # Consequence: the tail layers are bf16 only for FFN and experts,
+            # not for attention.
+            MXFP8LinearConverter.Config(
+                fqns=["attention.wq", "attention.wo"],
+                model_compile_enabled=model_compile_enabled,
+            ),
         ],
     )
     return config
