@@ -232,6 +232,16 @@ def deepseek_v3_16b_hybridep() -> Trainer.Config:
 def deepseek_v3_16b_nvfp4() -> Trainer.Config:
     config = deepseek_v3_16b()
     assert config.model_spec is not None
+    # Assign compile BEFORE deriving the flag, matching
+    # deepseek_v3_671b_nvfp4_mixed(). deepseek_v3_16b() sets compile=["loss"], so
+    # deriving from the inherited value gave False and the NVFP4 quantize around
+    # each grouped GEMM never fused. Deriving before assigning would be worse
+    # still: the model would compile while the converters believe they run eager.
+    config.compile = CompileConfig(enable=True, components=["model", "loss"])
+    # Match the bf16 and mxfp8 arms of the 16B convergence campaign. The default
+    # is 1/5 of upstream's steps=1000; the campaign runs 1500 and deliberately
+    # keeps 200, so a 100-step stable phase survives. All arms must share it.
+    config.lr_scheduler.warmup_steps = 200
     model_compile_enabled = (
         config.compile.enable and "model" in config.compile.components
     )
@@ -239,14 +249,34 @@ def deepseek_v3_16b_nvfp4() -> Trainer.Config:
     # exception: 16B's dense FeedForward is 2048 -> 10944, and 10944 % 128 == 64,
     # so it cannot be NVFP4 and layer 0 stays entirely bf16. The MoE layers'
     # grouped experts and shared experts convert for the leading decoder layers;
-    # the last _NVFP4_BF16_TAIL_FRACTION of layers stays bf16, as does attention.
-    # pad_multiple=128 is required by the NVFP4 grouped-mm kernel on sm_100.
+    # attention stays bf16. pad_multiple=128 is required by the NVFP4 grouped-mm
+    # kernel on sm_100.
+    #
+    # F0L0: no bf16 tail. Was 0.15, i.e. ceil(27 * 0.15) = 5 trailing layers held
+    # in bf16 (F0L5). MLPerf's DSV3-671B FP4 config sets neither
+    # num_layers_at_start_in_bf16 nor num_layers_at_end_in_bf16, so F0L0 is the
+    # reference recipe, and the 671B config here moves with it -- this arm exists
+    # to validate what 671B will actually run, so a more conservative holdout at
+    # 16B would test something we do not ship.
+    #
+    # ceil(0) = 0 leaves convert_upto = n_layers, which does NOT trip the
+    # convert_upto <= 0 guard in nvfp4_bf16_tail_fqns; layer 0 is still excluded
+    # separately because 16B's dense FeedForward is 2048 -> 10944 and
+    # 10944 % 128 == 64, so it cannot be NVFP4.
     n_layers = len(config.model_spec.model.layers)
-    _NVFP4_BF16_TAIL_FRACTION = 0.15
+    _NVFP4_BF16_TAIL_FRACTION = 0.0
     fqns = nvfp4_bf16_tail_fqns(n_layers, _NVFP4_BF16_TAIL_FRACTION)
     config.model_spec = model_registry(
         "16B",
         attn_backend="flex",
+        # HybridEP with a bounded buffer, matching the bf16 and mxfp8 arms.
+        # Omitting these ran the blocking dropless path, which is unbounded under
+        # real routing -- that is what killed bf16 round 1 (148 -> 214 GiB over
+        # 40 steps). cf 0.1875 is 2x balanced at ep-32: 6 / (32 x 2) = 0.09375.
+        # The 671B configs' 0.03125 does not port; 16B has 2 local experts
+        # against 671B's 8.
+        moe_comm_backend="hybridep",
+        non_blocking_capacity_factor=0.1875,
         converters=[
             NVFP4LinearConverter.Config(
                 model_compile_enabled=model_compile_enabled,
@@ -256,6 +286,20 @@ def deepseek_v3_16b_nvfp4() -> Trainer.Config:
                 model_compile_enabled=model_compile_enabled,
                 fqns=fqns,
                 pad_multiple=128,
+            ),
+            # Attention in MXFP8, matching deepseek_v3_671b_nvfp4_mixed. This arm
+            # exists to de-risk the 671B recipe, so the set of quantized modules
+            # has to be the same or its convergence result does not transfer.
+            # Bare fqns, no leading-layer prefix, so this covers every layer
+            # including any the NVFP4 tail would have skipped -- at F0L0 there is
+            # no tail, so both converters now span all 27 layers.
+            #
+            # 16B has q_lora_rank=0, so attention.wq is a single 2048->3072
+            # Linear rather than 671B's wq_a/wq_b pair; the same bare fqns match
+            # it by substring. wkv_a/wkv_b stay bf16, as at 671B.
+            MXFP8LinearConverter.Config(
+                fqns=["attention.wq", "attention.wo"],
+                model_compile_enabled=model_compile_enabled,
             ),
         ],
     )
@@ -356,8 +400,22 @@ def deepseek_v3_671b_nvfp4_mixed() -> Trainer.Config:
     model_compile_enabled = (
         config.compile.enable and "model" in config.compile.components
     )
+    # F0L0: no bf16 tail. Was 0.15, i.e. ceil(61 * 0.15) = 10 trailing layers in
+    # bf16 -- exactly the deck's F0L10 row. MLPerf's DSV3-671B FP4 config sets
+    # neither num_layers_at_start_in_bf16 nor num_layers_at_end_in_bf16, so F0L0
+    # is the reference recipe.
+    #
+    # CAVEAT, not yet tested here: MLPerf pairs F0L0 with BF16_PROJ=True (all MLA
+    # projections in BF16) and an MXFP8 block-scaled DPA. This branch instead puts
+    # wq_a/wq_b/wo in MXFP8, leaves wkv_a/wkv_b bf16, and does not quantize the
+    # DPA. The Kitchen deck records "F0L0, but BF16 linear for projections in all
+    # MLA improves convergence significantly", so MLPerf's convergence result
+    # covers F0L0 + bf16 MLA projections, not this combination. Empirically the
+    # mxfp8-attn cell is the loss-cleanest nvfp4 cell measured (mean +0.0099 vs
+    # bf16, slope -0.0033, 0.19% relative), so the projections are not hurting at
+    # a 340-step horizon -- but F0L0 + mxfp8 projections is a new cell.
     n_layers = len(config.model_spec.model.layers)
-    fqns = nvfp4_bf16_tail_fqns(n_layers, 0.15)
+    fqns = nvfp4_bf16_tail_fqns(n_layers, 0.0)
     config.model_spec = model_registry(
         "671B",
         attn_backend="flex",
