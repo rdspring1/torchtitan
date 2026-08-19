@@ -287,20 +287,29 @@ def deepseek_v3_16b_nvfp4() -> Trainer.Config:
                 fqns=fqns,
                 pad_multiple=128,
             ),
-            # Attention in MXFP8, matching deepseek_v3_671b_nvfp4_mixed. This arm
-            # exists to de-risk the 671B recipe, so the set of quantized modules
-            # has to be the same or its convergence result does not transfer.
-            # Bare fqns, no leading-layer prefix, so this covers every layer
-            # including any the NVFP4 tail would have skipped -- at F0L0 there is
-            # no tail, so both converters now span all 27 layers.
+            # BISECT VARIANT A -- the MXFP8 attention converter is REMOVED here,
+            # deliberately, and this branch exists only to run that experiment.
+            # Do not merge it and do not build it for anything else.
             #
-            # 16B has q_lora_rank=0, so attention.wq is a single 2048->3072
-            # Linear rather than 671B's wq_a/wq_b pair; the same bare fqns match
-            # it by substring. wkv_a/wkv_b stay bf16, as at 671B.
-            MXFP8LinearConverter.Config(
-                fqns=["attention.wq", "attention.wo"],
-                model_compile_enabled=model_compile_enabled,
-            ),
+            # deepseek_v3_16b_nvfp4 NaNs on the forward loss at step 1 from a
+            # cold start (pipelines 63540771 at 16 nodes, 63552118 at 2). All
+            # five of this function's changes landed in 18ddecc0 at once, and
+            # three of them -- model compile, warmup 200, hybridep at cf 0.1875
+            # -- are attested by the bf16 arm's 1500 clean steps at 16B. That
+            # leaves F0L0 and this converter, and a step-1 forward NaN on freshly
+            # initialised weights is a broken forward pass rather than the
+            # gradual divergence that removing F0L0's margin would predict.
+            #
+            # This converter is the newer suspect for a structural reason: 16B
+            # has q_lora_rank=0, so attention.wq is a single 2048 -> 3072 Linear
+            # where 671B has the wq_a/wq_b pair, and MXFP8 over a fused wq has
+            # never run at any scale. Shapes are not the issue -- wq 2048->3072
+            # and wo 2048->2048 are divisible by both 128 and 32.
+            #
+            # Clean at 2 nodes/20 steps => this converter is the fault and F0L0
+            # is exonerated. Still NaN => F0L0 is implicated and variant B
+            # (restore _NVFP4_BF16_TAIL_FRACTION = 0.15, keep this converter) is
+            # the next run.
         ],
     )
     return config
