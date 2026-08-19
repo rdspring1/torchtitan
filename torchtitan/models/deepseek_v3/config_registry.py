@@ -264,7 +264,15 @@ def deepseek_v3_16b_nvfp4() -> Trainer.Config:
     # separately because 16B's dense FeedForward is 2048 -> 10944 and
     # 10944 % 128 == 64, so it cannot be NVFP4.
     n_layers = len(config.model_spec.model.layers)
-    _NVFP4_BF16_TAIL_FRACTION = 0.0
+    # BISECT VARIANT C -- the tail fraction is restored to 0.15 here,
+    # deliberately. Experiment branch; do not merge.
+    #
+    # This is the "how many" half of the bisect: ceil(27 * 0.15) = 5, so layers
+    # 22-26 go back to bf16 and only layers 0-21 convert, exactly as on
+    # f5889f85. Compile, hybridep, the capacity factor and both converters are
+    # left at their 18ddecc0 values, so this is single-variable. Variant B is
+    # the "how" half and runs concurrently.
+    _NVFP4_BF16_TAIL_FRACTION = 0.15
     fqns = nvfp4_bf16_tail_fqns(n_layers, _NVFP4_BF16_TAIL_FRACTION)
     config.model_spec = model_registry(
         "16B",
