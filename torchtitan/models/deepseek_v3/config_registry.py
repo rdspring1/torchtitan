@@ -232,12 +232,20 @@ def deepseek_v3_16b_hybridep() -> Trainer.Config:
 def deepseek_v3_16b_nvfp4() -> Trainer.Config:
     config = deepseek_v3_16b()
     assert config.model_spec is not None
-    # Assign compile BEFORE deriving the flag, matching
-    # deepseek_v3_671b_nvfp4_mixed(). deepseek_v3_16b() sets compile=["loss"], so
-    # deriving from the inherited value gave False and the NVFP4 quantize around
-    # each grouped GEMM never fused. Deriving before assigning would be worse
-    # still: the model would compile while the converters believe they run eager.
-    config.compile = CompileConfig(enable=True, components=["model", "loss"])
+    # BISECT VARIANT B -- the compile assignment is REMOVED here, deliberately.
+    # Experiment branch; do not merge.
+    #
+    # 18ddecc0 added `config.compile = CompileConfig(enable=True,
+    # components=["model","loss"])` above the derive, which flips
+    # model_compile_enabled from False to True and makes inductor fuse the NVFP4
+    # quantize around each GEMM. Dropping it restores deepseek_v3_16b()'s
+    # inherited compile=["loss"], so the converters run EAGER as they did on
+    # f5889f85, which was clean at 2 nodes to step 50.
+    #
+    # This is the "how" half of the remaining bisect: it changes how every NVFP4
+    # GEMM executes without changing which layers are quantized. Variant C is the
+    # "how many" half. Both are single-variable against 18ddecc0 and run
+    # concurrently.
     # Match the bf16 and mxfp8 arms of the 16B convergence campaign. The default
     # is 1/5 of upstream's steps=1000; the campaign runs 1500 and deliberately
     # keeps 200, so a 100-step stable phase survives. All arms must share it.
