@@ -269,14 +269,32 @@ def deepseek_v3_16b_nvfp4() -> Trainer.Config:
     config.model_spec = model_registry(
         "16B",
         attn_backend="flex",
-        # HybridEP with a bounded buffer, matching the bf16 and mxfp8 arms.
-        # Omitting these ran the blocking dropless path, which is unbounded under
-        # real routing -- that is what killed bf16 round 1 (148 -> 214 GiB over
-        # 40 steps). cf 0.1875 is 2x balanced at ep-32: 6 / (32 x 2) = 0.09375.
-        # The 671B configs' 0.03125 does not port; 16B has 2 local experts
-        # against 671B's 8.
-        moe_comm_backend="hybridep",
-        non_blocking_capacity_factor=0.1875,
+        # BISECT VARIANT D -- moe_comm_backend and non_blocking_capacity_factor
+        # are REMOVED here, deliberately. Experiment branch; do not merge.
+        #
+        # The last of 18ddecc0's four candidate changes. Variants A (attention
+        # converter), B (model compile) and C (F0L0 tail) were each reverted
+        # individually and the step-1 NaN survived all three, so either this is
+        # the single cause or no single revert breaks it.
+        #
+        # WHAT THIS IS AND IS NOT TESTING. The probe product inherits
+        # force_load_balance=true, so every expert already receives an identical
+        # token count and A/B/C all ran HybridEP with ZERO tokens dropped -- and
+        # NaN'd anyway. Capacity-driven dropping is therefore already excluded.
+        # This tests whether HybridEP's token LAYOUT is incompatible with the
+        # NVFP4 grouped mm, which consumes per-expert offsets and requires
+        # pad_multiple=128. bf16 ran HybridEP for 1500 clean steps but has no
+        # grouped-experts converter, so that combination is untested at 16B.
+        # 671B runs it cleanly at cf 0.03125 with 8 local experts and
+        # moe_hidden_dim 2048, against 16B's 2 local experts and 1408 -- which
+        # is not divisible by 256 where 2048 and 7168 are, and AUTO falls back
+        # silently.
+        #
+        # RISK. Removing these restores the dropless path, which is unbounded
+        # under real routing and is what killed bf16 round 1 (148 -> 214 GiB
+        # over 40 steps). Forced load balance makes demand uniform here and it
+        # is 2 nodes for 20 steps, so it should stay well inside memory. An OOM
+        # would be an inconclusive run, not a result.
         converters=[
             NVFP4LinearConverter.Config(
                 model_compile_enabled=model_compile_enabled,
