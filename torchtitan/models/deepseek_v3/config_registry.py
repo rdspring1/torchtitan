@@ -275,8 +275,31 @@ def deepseek_v3_16b_nvfp4() -> Trainer.Config:
         # 40 steps). cf 0.1875 is 2x balanced at ep-32: 6 / (32 x 2) = 0.09375.
         # The 671B configs' 0.03125 does not port; 16B has 2 local experts
         # against 671B's 8.
+        # BISECT VARIANT F -- HybridEP KEPT, non_blocking_capacity_factor REMOVED
+        # so the dispatcher runs in BLOCKING mode. Experiment branch; do not merge.
+        #
+        # Variant D removed HybridEP entirely and was clean, which identified the
+        # dispatcher but could not say which part of it. D changes the whole comm
+        # path; this changes only how the permuted buffer is sized.
+        #
+        #   non_blocking (cf set):  no D2H sync allowed, so num_permuted_tokens is
+        #       ESTIMATED on GPU as num_tokens x ep_size x
+        #       min(num_local_experts, top_k) x cf, rounded to pad_multiple, and
+        #       tokens past that limit are SILENTLY DROPPED (hybridep.py:177-182).
+        #   blocking (cf None):     cudaStreamSynchronize after dispatch, counts
+        #       copied to pinned CPU, EXACT num_permuted_tokens computed on host.
+        #       No dropping.
+        #
+        # Clean here => the defect is in the non-blocking capacity estimate or the
+        # fused-permute sizing, not in HybridEP's layout. That would also be a
+        # shippable workaround: blocking HybridEP costs a sync per dispatch but,
+        # unlike the dropless path, neither drops tokens nor grows unbounded.
+        # NaN here => HybridEP's dispatch is implicated regardless of sizing mode.
+        #
+        # Note this is NOT a test of capacity-driven dropping: the probe product
+        # inherits force_load_balance=true, so nothing was being dropped in any
+        # variant. It is a test of the sizing PATH, not of overflow.
         moe_comm_backend="hybridep",
-        non_blocking_capacity_factor=0.1875,
         converters=[
             NVFP4LinearConverter.Config(
                 model_compile_enabled=model_compile_enabled,
