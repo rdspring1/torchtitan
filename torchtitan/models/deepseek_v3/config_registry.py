@@ -237,7 +237,14 @@ def deepseek_v3_16b_nvfp4() -> Trainer.Config:
     # deriving from the inherited value gave False and the NVFP4 quantize around
     # each grouped GEMM never fused. Deriving before assigning would be worse
     # still: the model would compile while the converters believe they run eager.
-    config.compile = CompileConfig(enable=True, components=["model", "loss"])
+    # VARIANT F2: model compile OFF. Variant F ran blocking HybridEP at this
+    # same revision and died in a compile shape guard before completing a step
+    # (expected size 786432==131072 at dim=0 -- a factor of exactly top_k=6),
+    # so compile had specialized on the non-blocking capacity-sized shape and
+    # blocking's exact-sized buffer tripped the guard. The blocking result was
+    # never observed. Dropping model compile removes the guard; loss compile is
+    # kept so only one thing changes from F.
+    config.compile = CompileConfig(enable=True, components=["loss"])
     # Match the bf16 and mxfp8 arms of the 16B convergence campaign. The default
     # is 1/5 of upstream's steps=1000; the campaign runs 1500 and deliberately
     # keeps 200, so a 100-step stable phase survives. All arms must share it.
