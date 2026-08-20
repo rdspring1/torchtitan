@@ -403,12 +403,8 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
 
         def _grouped_mm(self, *, A, B_t, offs):
             # torchao's NVFP4 grouped MM takes the un-transposed weight B (E, N, K)
-            # and quantizes the whole activation block, so the final offset must
-            # cover the dispatcher's padding tail (TorchAOTokenDispatcher leaves a
-            # sentinel tail that the per-expert counts exclude). Clone before the
-            # in-place write so the shared per-forward offsets tensor is untouched.
-            offs = offs.clone()
-            offs[-1] = A.shape[0]
+            # and uses the final dispatcher offset as the logical token bound. A may
+            # have additional allocation capacity, which torchao leaves untouched.
             return _to_nvfp4_rht_rs_then_scaled_grouped_mm(
                 A,
                 B_t.transpose(-2, -1),

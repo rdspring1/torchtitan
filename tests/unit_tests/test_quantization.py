@@ -376,6 +376,39 @@ def test_quantized_grouped_experts():
     assert hasattr(nvfp4_gptoss_cls.Config, "swiglu_limit")
 
 
+def test_nvfp4_grouped_experts_preserves_logical_tail_offset(monkeypatch):
+    """Dispatcher allocation capacity must not extend the final expert."""
+    pytest.importorskip("torchao")
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    if nvfp4_mod.NVFP4Linear is None:
+        pytest.skip("torchao NVFP4 training prototype not available")
+
+    forwarded = {}
+
+    def grouped_mm_stub(*args, **kwargs):
+        forwarded["offs"] = kwargs["offs"]
+        return args[0]
+
+    monkeypatch.setattr(
+        nvfp4_mod, "_to_nvfp4_rht_rs_then_scaled_grouped_mm", grouped_mm_stub
+    )
+    NVFP4Experts = nvfp4_mod._get_nvfp4_grouped_experts_cls(GroupedExperts)
+
+    class RuntimeState:
+        rht_sign_vector = (1,) * 16
+        _sr_seed = torch.zeros(1, dtype=torch.int64)
+
+    A = torch.empty(384, 128)
+    B_t = torch.empty(2, 128, 128)
+    offs = torch.tensor([128, 256], dtype=torch.int32)
+
+    NVFP4Experts._grouped_mm(RuntimeState(), A=A, B_t=B_t, offs=offs)
+
+    assert forwarded["offs"] is offs
+    assert offs[-1] < A.shape[0]
+
+
 def test_nvfp4_grouped_experts_converter_targets_leading_moe_layers(monkeypatch):
     """The DSV3 NVFP4 recipe swaps only the leading-85% MoE layers' experts to the
     NVFP4 subclass and swaps their dispatcher to TorchAOTokenDispatcher(pad=128);
