@@ -18,6 +18,7 @@ Configuration (via HybridEPTokenDispatcher.Config):
         MXFP8.  See _num_permuted_tokens_for_non_blocking().
 """
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -110,6 +111,67 @@ def _num_permuted_tokens_for_non_blocking(
 # Custom op registration for torch.compile and SAC compatibility
 
 
+# ---------------------------------------------------------------------------
+# Debug instrumentation for the NVFP4 surplus-capacity NaN.
+#
+# Bisection (dsv3/dsv3_16b_convergence_run/nvfp4/RUN_LOG.md) showed that the 16B
+# NVFP4 step-1 forward NaN appears exactly when HybridEP's permuted buffer has
+# surplus rows, on BOTH the Triton and CuteDSL backends, and disappears when the
+# capacity factor is set to the exact fit. The remaining question is why ao's
+# masks do not protect against it. Every grouped amax/quantize entry point
+# defaults its mask to ``logical_packed_length = offsets[-1]``, so the masking
+# is only correct if offsets[-1] is the PACKED length and not the buffer
+# CAPACITY. This prints both so they can be compared directly.
+#
+# ALWAYS ON in this build, and capped at the first few dispatches. It calls
+# .item() and .isfinite() on device tensors, which force D2H syncs and defeat the
+# whole point of non-blocking dispatch -- so this branch is a diagnostic build
+# and must never produce a throughput or convergence number.
+#
+# Not gated behind an env var deliberately: the branch exists for exactly one
+# run, and a gate only adds a way for that run to silently produce nothing if the
+# variable fails to reach the container.
+_HYBRIDEP_DEBUG_CALLS = 0
+
+
+def _log_dispatch_extent(hidden, tokens_per_expert, num_permuted_tokens, num_tokens, top_k):
+    """Print buffer capacity vs packed length vs true demand for one dispatch."""
+    global _HYBRIDEP_DEBUG_CALLS
+    limit = int(os.environ.get("TORCHTITAN_HYBRIDEP_DEBUG_CALLS", "4"))
+    if _HYBRIDEP_DEBUG_CALLS >= limit:
+        return
+    _HYBRIDEP_DEBUG_CALLS += 1
+
+    buffer_rows = hidden.shape[0]
+    packed_rows = int(tokens_per_expert.sum().item())   # this becomes offsets[-1]
+    demand = num_tokens * top_k
+    capacity = num_permuted_tokens if num_permuted_tokens is not None else buffer_rows
+
+    # The discriminating question: does the value the masks use (packed_rows)
+    # track the real data extent, or the allocation?
+    if packed_rows == demand:
+        verdict = "packed==demand -> masks bound the real data; surplus is NOT read via offsets[-1]"
+    elif packed_rows == buffer_rows:
+        verdict = "packed==BUFFER -> masks bound the ALLOCATION; surplus IS inside the masked region"
+    else:
+        verdict = "packed matches neither -- read the per-expert counts"
+
+    tail = buffer_rows - packed_rows
+    msg = (
+        f"[hybridep-debug {_HYBRIDEP_DEBUG_CALLS}/{limit}] "
+        f"capacity={capacity} buffer_rows={buffer_rows} packed_rows(offs[-1])={packed_rows} "
+        f"demand={demand} tail_rows={tail} :: {verdict}"
+    )
+
+    # If there is a tail, say whether it is finite. A NaN/Inf there plus a mask
+    # that does not exclude it is the whole failure in one line.
+    if tail > 0:
+        tail_slice = hidden[packed_rows:]
+        finite = bool(torch.isfinite(tail_slice.float()).all().item())
+        msg += f" tail_all_finite={finite}"
+    logger.info(msg)
+
+
 @torch.library.custom_op("hybridep::dispatch", mutates_args=(), device_types="cuda")
 def _dispatch_impl(
     x: torch.Tensor,
@@ -182,6 +244,10 @@ def _dispatch_impl(
     # via _num_permuted_tokens_for_non_blocking is therefore critical:
     # capacity_factor=1.0 → worst-case sizing, no drops, most memory;
     # capacity_factor<1.0 → less memory, but tokens may be dropped.
+
+    _log_dispatch_extent(
+        hidden, tokens_per_expert, num_permuted_tokens, x.shape[0], topk_idx.shape[1]
+    )
 
     if scores is None:
         scores = torch.empty(0, device=x.device, dtype=torch.float32)
