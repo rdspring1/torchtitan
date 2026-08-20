@@ -276,7 +276,37 @@ def deepseek_v3_16b_nvfp4() -> Trainer.Config:
         # The 671B configs' 0.03125 does not port; 16B has 2 local experts
         # against 671B's 8.
         moe_comm_backend="hybridep",
-        non_blocking_capacity_factor=0.1875,
+        # BISECT VARIANT G -- capacity factor set to the EXACT FIT, 0.125.
+        # Experiment branch; do not merge.
+        #
+        # The sharpest test of the tail hypothesis. Variant F (blocking mode)
+        # also removes the tail, but it changes the sizing code path from
+        # GPU-estimate to host-exact and adds a sync, so a clean F cannot say
+        # which of those mattered. This keeps NON-BLOCKING dispatch, the same
+        # estimate formula and the same kernels, and only sizes the buffer with
+        # no surplus.
+        #
+        # capacity = num_tokens x ep_size x min(local, top_k) x cf
+        # demand   = num_tokens x top_k
+        # => exact fit cf = top_k / (ep_size x min(local, top_k))
+        #
+        # At the probe's ep-8: local = 64/8 = 8, min(8, 6) = 6, so the exact fit
+        # is 6/(8x6) = 0.125 and the shipped 0.1875 leaves a 33% tail.
+        # NOTE this is ep-dependent: at the arm's ep-32, local = 2, min(2,6) = 2,
+        # exact fit = 6/(32x2) = 0.09375 and 0.1875 leaves a 50% tail. Do not
+        # port 0.125 to ep-32.
+        #
+        # Why 671B never hit this: at ep-64 local = 4, min(4,8) = 4, exact fit =
+        # 8/(64x4) = 0.03125 -- exactly what deepseek_v3_671b_nvfp4_mixed ships.
+        # Its buffer has NO tail, which is why the combination runs clean there
+        # and dies here.
+        #
+        # clean -> the quantization kernels mishandle the surplus rows, and the
+        #          real fix is masking in ao, not a cf change: real routing needs
+        #          headroom, so the exact fit is only safe under forced balance.
+        # NaN   -> the tail is not the mechanism; F then separates sizing path
+        #          from layout.
+        non_blocking_capacity_factor=0.125,
         converters=[
             NVFP4LinearConverter.Config(
                 model_compile_enabled=model_compile_enabled,
