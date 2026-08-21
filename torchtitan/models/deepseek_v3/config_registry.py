@@ -426,14 +426,16 @@ def deepseek_v3_671b_nvfp4_mixed() -> Trainer.Config:
         # independent of ep, so top_k/256 = 0.03125 is the exact fit for any
         # ep >= 32; it only changes at ep-16, to 0.0625.
         #
-        # This is a no-waste default, not a fix for a known failure. An earlier
-        # 12-layer run NaN'd at a larger capacity factor and was clean at the
-        # exact fit, but the two runs also built different commits, so the
-        # factor was never isolated -- and the mechanism proposed at the time
-        # (surplus leaving slack rows inside declared expert groups) is
-        # refuted: reported per-expert counts stay at actual padded demand, and
-        # the NVFP4 kernels mask loads against logical_packed_length, so rows
-        # past offs[-1] are never read.
+        # This is a no-waste default. It is no longer a constraint: the earlier
+        # 12-layer NaN at a larger capacity factor was the offs[-1] = A.shape[0]
+        # rewrite extending the last expert group over the whole capacity
+        # buffer, so the spare rows fed that group's global amax. The NVFP4
+        # kernels do mask loads against logical_packed_length, but that bound is
+        # padded_group_end_offsets[-1], so the rewrite made the mask vacuous --
+        # which is why the masking looked like it ruled the mechanism out.
+        # Fixed by torchtitan 791f2415 + torchao 14555766 and verified at the
+        # unchanged failing cf 0.1875, so exact fit is kept here only because it
+        # wastes nothing, not because raising it is unsafe.
         non_blocking_capacity_factor=0.03125,
         converters=[
             NVFP4LinearConverter.Config(
