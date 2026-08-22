@@ -74,11 +74,61 @@ try:
         nvfp4_linear,
         nvfp4_mm_triton,
     )
+    from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
+        cutedsl_nvfp4_kernels_available,
+        cutedsl_nvfp4_unavailable_reason,
+    )
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_training import (
         _make_rht_sign_vector,
         _rht_sign_vector_to_tuple,
         NVFP4Linear as TorchAONVFP4Linear,
     )
+    from torchao.quantization.quantize_.common import KernelPreference
+
+    _SUPPORTED_KERNEL_PREFERENCES = (
+        KernelPreference.AUTO,
+        KernelPreference.TRITON,
+        KernelPreference.CUTEDSL,
+    )
+
+    def _to_kernel_preference(name: str) -> KernelPreference:
+        """Validate a config string into the enum torchao's NVFP4 paths accept.
+
+        Both AO seams default to ``AUTO``, which silently takes CuteDSL when its
+        runtime is importable and Triton otherwise -- so with no explicit choice
+        the backend is a property of the container image rather than the recipe,
+        and two runs of the same config can measure different kernels.
+        """
+        try:
+            pref = KernelPreference(name)
+        except ValueError:
+            pref = None
+        if pref not in _SUPPORTED_KERNEL_PREFERENCES:
+            raise ValueError(
+                "NVFP4 kernel_preference must be one of "
+                f"{[p.value for p in _SUPPORTED_KERNEL_PREFERENCES]}, got {name!r}"
+            )
+        return pref
+
+    def _log_kernel_preference(what: str, pref: KernelPreference) -> None:
+        """Record the preference and the backend it actually resolves to.
+
+        AUTO is legitimate, but it must not be silent: the resolved backend is
+        what a later comparison against these numbers has to match.
+        """
+        if pref is KernelPreference.CUTEDSL and not cutedsl_nvfp4_kernels_available():
+            raise RuntimeError(
+                f"{what} kernel_preference=cutedsl, but the CuteDSL runtime is "
+                f"unavailable ({cutedsl_nvfp4_unavailable_reason()})."
+            )
+        resolved = (
+            "triton"
+            if pref is KernelPreference.TRITON
+            else ("cutedsl" if cutedsl_nvfp4_kernels_available() else "triton")
+        )
+        logger.info(
+            "%s kernel_preference=%s, resolved backend=%s", what, pref.value, resolved
+        )
 
     # The NVFP4 GEMM is a raw autograd Function that runs on local shards inside
     # the spmd.local_map region. Mark it local-safe so SPMD type checking
@@ -99,6 +149,12 @@ try:
         @dataclass(kw_only=True, slots=True)
         class Config(Linear.Config):
             """Drop-in replacement for Linear.Config that builds NVFP4Linear."""
+
+            kernel_preference: str = "auto"
+            """NVFP4 quantization backend: "auto", "triton", or "cutedsl"."""
+
+            use_fast_math: bool = True
+            """Approximate-reciprocal RHT quantize, matching TE's NVTE_USE_FAST_MATH=1."""
 
             def __post_init__(self) -> None:
                 # NVFP4's Triton kernels need every GEMM dim to be a multiple of
@@ -166,6 +222,11 @@ try:
                 config.out_features,
                 bias=config.bias,
             )
+            # Resolved once here rather than per forward: _resolve_use_cutedsl
+            # walks importlib.util.find_spec over four packages, and forward and
+            # backward must agree on the backend.
+            self._kernel_preference = _to_kernel_preference(config.kernel_preference)
+            self._use_fast_math = config.use_fast_math
             # TorchAO created the runtime buffers on the (meta) build device.
             # Re-register them as None so ``_distribute_states`` skips them and
             # ``_init_self_buffers`` materializes them on the real device, per
@@ -241,6 +302,8 @@ try:
                 self.bias,
                 sr_seed=self._sr_seed,
                 sign_vector=self.rht_sign_vector,
+                kernel_preference=self._kernel_preference,
+                use_fast_math=self._use_fast_math,
             )
 
 except ImportError:
@@ -280,6 +343,18 @@ class NVFP4LinearConverter(QuantizationConverter):
         the LM head in bf16, which the mixed recipe leaves unquantized for stability.
         """
 
+        kernel_preference: str = "auto"
+        """NVFP4 quantization backend: "auto", "triton", or "cutedsl".
+
+        Pin this rather than leaving it at "auto" for any run whose throughput is
+        compared against another: "auto" resolves to CuteDSL when its runtime is
+        importable and Triton otherwise, so the same recipe measures different
+        kernels on containers that differ only in which packages are installed.
+        """
+
+        use_fast_math: bool = True
+        """Approximate-reciprocal RHT quantize, matching TE's NVTE_USE_FAST_MATH=1."""
+
     def __init__(self, config: Config):
         self.config = config
 
@@ -299,6 +374,9 @@ class NVFP4LinearConverter(QuantizationConverter):
                 "of NVFP4 dynamic quantization."
             )
 
+        self._kernel_preference = _to_kernel_preference(self.config.kernel_preference)
+        _log_kernel_preference("NVFP4Linear", self._kernel_preference)
+
     def convert(self, model_config):
         assert NVFP4Linear is not None
         fqns = self.config.fqns
@@ -309,6 +387,8 @@ class NVFP4LinearConverter(QuantizationConverter):
                     out_features=config.out_features,
                     bias=config.bias,
                     param_init=config.param_init,
+                    kernel_preference=self.config.kernel_preference,
+                    use_fast_math=self.config.use_fast_math,
                 )
                 if parent is None:
                     model_config = new_config
@@ -345,10 +425,16 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
     class NVFP4GroupedExperts(parent_cls):  # type: ignore[valid-type, misc]
         @dataclass(kw_only=True, slots=True)
         class Config(parent_config_cls):  # type: ignore[misc]
-            pass
+            kernel_preference: str = "auto"
+            """NVFP4 quantization backend: "auto", "triton", or "cutedsl"."""
+
+            use_fast_math: bool = True
+            """Approximate-reciprocal RHT quantize, matching TE's NVTE_USE_FAST_MATH=1."""
 
         def __init__(self, config: Config):
             super().__init__(config)
+            self._kernel_preference = _to_kernel_preference(config.kernel_preference)
+            self._use_fast_math = config.use_fast_math
             # Same buffer protocol as NVFP4Linear.__init__: register the runtime
             # buffers as None so _distribute_states skips them and
             # _init_self_buffers materializes them per rank on the real device.
@@ -412,6 +498,8 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
                 self._sr_seed,
                 offs=offs,
                 pad_token_groups_for_grouped_mm=False,
+                kernel_preference=self._kernel_preference,
+                use_fast_math=self._use_fast_math,
             )
 
     NVFP4GroupedExperts.__name__ = f"NVFP4{parent_cls.__name__}"
@@ -438,6 +526,16 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
         alignment. TorchAO's NVFP4 Triton kernels require multiples of 128.
         """
 
+        kernel_preference: str = "auto"
+        """NVFP4 quantization backend: "auto", "triton", or "cutedsl".
+
+        The grouped path resolves per op, so "auto" can mix backends within one
+        step. Pin it for any run whose throughput is compared against another.
+        """
+
+        use_fast_math: bool = True
+        """Approximate-reciprocal RHT quantize, matching TE's NVTE_USE_FAST_MATH=1."""
+
     def __init__(self, config: Config):
         self.config = config
 
@@ -460,6 +558,9 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
                 "of NVFP4 dynamic quantization."
             )
 
+        self._kernel_preference = _to_kernel_preference(self.config.kernel_preference)
+        _log_kernel_preference("NVFP4GroupedExperts", self._kernel_preference)
+
     def convert(self, model_config):
         fqns = self.config.fqns
         for fqn, config, parent, attr in model_config.traverse(GroupedExperts.Config):
@@ -473,6 +574,10 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
             new_config = config_cls(
                 **{f.name: getattr(config, f.name) for f in fields(config)}
             )
+            # The comprehension copies the parent GroupedExperts.Config fields
+            # only, so the two NVFP4-specific ones are set explicitly.
+            new_config.kernel_preference = self.config.kernel_preference
+            new_config.use_fast_math = self.config.use_fast_math
             if parent is None:
                 model_config = new_config
             elif isinstance(parent, list):
