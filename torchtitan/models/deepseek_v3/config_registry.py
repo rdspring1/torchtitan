@@ -278,14 +278,20 @@ def deepseek_v3_16b_nvfp4() -> Trainer.Config:
         moe_comm_backend="hybridep",
         non_blocking_capacity_factor=0.1875,
         converters=[
+            # TEST-ONLY BRANCH: kernel_preference pinned to triton so the paired
+            # AUTO run on nvfp4_kp_timeout has something to contrast against.
+            # Proves the value reaches the kernels, not just the logger. This
+            # branch is never merged.
             NVFP4LinearConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=_nvfp4_ffn_linear_fqns(fqns, _NVFP4_FFN_SUBMODULES_NO_DENSE),
+                kernel_preference="triton",
             ),
             NVFP4GroupedExpertsConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=fqns,
                 pad_multiple=128,
+                kernel_preference="triton",
             ),
             # Attention in MXFP8, matching deepseek_v3_671b_nvfp4_mixed. This arm
             # exists to de-risk the 671B recipe, so the set of quantized modules
