@@ -499,6 +499,36 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             f"({device_mem_stats.max_reserved_pct:.2f}%)"
         )
 
+        # Give the mesh process groups the configured init timeout before step 1.
+        #
+        # init_process_group() takes comm.init_timeout_seconds, but that only
+        # reaches the world PG. The sub-groups init_device_mesh() builds --
+        # mesh_pp, mesh_fsdp, mesh_efsdp -- get PyTorch's hardcoded
+        # _DEFAULT_PG_NCCL_TIMEOUT of 600s, which torch/distributed/constants.py
+        # exposes no override for. So the first step, which is exactly where lazy
+        # init and compilation land, runs its mesh collectives at 600s no matter
+        # what the user configured. The reduction to train_timeout_seconds below
+        # already assumes the opposite ("assuming lazy init and compilation are
+        # finished"); this is the other half of that intent.
+        #
+        # max() so this can never shorten anyone's timeout: both
+        # init_timeout_seconds (300) and train_timeout_seconds (100) default
+        # below 600, and reducing the mesh groups would be a regression for every
+        # configuration that does not set them.
+        #
+        # Observed failure this fixes: DSV3 671B at PP2/VP8 with
+        # compile.components model,loss hung with zero steps logged, every
+        # reporting rank waiting at the same SeqNum in _ALLGATHER_BASE, killed by
+        # the watchdog at exactly 600002ms. Compiling 16 virtual stages is slow
+        # and the pipeline serializes it, so one stage's compile is another
+        # stage's blocking wait.
+        dist_utils.set_pg_timeouts(
+            timeout=timedelta(
+                seconds=max(600, config.comm.init_timeout_seconds)
+            ),
+            parallel_dims=self.parallel_dims,
+        )
+
         # build optimizer after applying parallelisms to the model
         self.optimizers = config.optimizer.build(model_parts=self.model_parts)
         if model_spec.post_optimizer_build_fn is not None:
