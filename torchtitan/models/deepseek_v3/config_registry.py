@@ -278,14 +278,20 @@ def deepseek_v3_16b_nvfp4() -> Trainer.Config:
         moe_comm_backend="hybridep",
         non_blocking_capacity_factor=0.1875,
         converters=[
+            # TEST-ONLY BRANCH: kernel_preference pinned to cutedsl. Should
+            # reproduce the AUTO cell exactly, since AUTO resolved to cutedsl on
+            # this image, and unlike AUTO it raises rather than silently falling
+            # back if the runtime is missing. Never merged.
             NVFP4LinearConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=_nvfp4_ffn_linear_fqns(fqns, _NVFP4_FFN_SUBMODULES_NO_DENSE),
+                kernel_preference="cutedsl",
             ),
             NVFP4GroupedExpertsConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=fqns,
                 pad_multiple=128,
+                kernel_preference="cutedsl",
             ),
             # Attention in MXFP8, matching deepseek_v3_671b_nvfp4_mixed. This arm
             # exists to de-risk the 671B recipe, so the set of quantized modules
