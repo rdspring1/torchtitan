@@ -150,7 +150,7 @@ try:
         class Config(Linear.Config):
             """Drop-in replacement for Linear.Config that builds NVFP4Linear."""
 
-            kernel_preference: str = "auto"
+            kernel_preference: str = "cutedsl"
             """NVFP4 quantization backend: "auto", "triton", or "cutedsl"."""
 
             use_fast_math: bool = True
@@ -343,13 +343,14 @@ class NVFP4LinearConverter(QuantizationConverter):
         the LM head in bf16, which the mixed recipe leaves unquantized for stability.
         """
 
-        kernel_preference: str = "auto"
+        kernel_preference: str = "cutedsl"
         """NVFP4 quantization backend: "auto", "triton", or "cutedsl".
 
-        Pin this rather than leaving it at "auto" for any run whose throughput is
-        compared against another: "auto" resolves to CuteDSL when its runtime is
-        importable and Triton otherwise, so the same recipe measures different
-        kernels on containers that differ only in which packages are installed.
+        Defaults to "cutedsl" so that throughput runs are pinned by default.
+        "auto" resolves to CuteDSL when its runtime is importable and Triton
+        otherwise, so it measures different kernels on containers that differ
+        only in which packages are installed -- and it does so silently, whereas
+        "cutedsl" raises when the runtime is missing.
         """
 
         use_fast_math: bool = True
@@ -425,7 +426,7 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
     class NVFP4GroupedExperts(parent_cls):  # type: ignore[valid-type, misc]
         @dataclass(kw_only=True, slots=True)
         class Config(parent_config_cls):  # type: ignore[misc]
-            kernel_preference: str = "auto"
+            kernel_preference: str = "cutedsl"
             """NVFP4 quantization backend: "auto", "triton", or "cutedsl"."""
 
             use_fast_math: bool = True
@@ -526,11 +527,13 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
         alignment. TorchAO's NVFP4 Triton kernels require multiples of 128.
         """
 
-        kernel_preference: str = "auto"
+        kernel_preference: str = "cutedsl"
         """NVFP4 quantization backend: "auto", "triton", or "cutedsl".
 
+        Defaults to "cutedsl" so that throughput runs are pinned by default.
         The grouped path resolves per op, so "auto" can mix backends within one
-        step. Pin it for any run whose throughput is compared against another.
+        step; "cutedsl" cannot, and raises if the runtime is missing or the
+        local expert count exceeds torchao's MAX_GROUPS (64).
         """
 
         use_fast_math: bool = True
