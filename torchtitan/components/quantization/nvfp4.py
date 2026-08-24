@@ -37,8 +37,8 @@ from .utils import swap_token_dispatcher
 
 TP = MeshAxisName.TP
 
-# TorchAO's NVFP4 Triton kernels require each local GEMM dimension to be a
-# multiple of 128.
+# TorchAO's NVFP4 kernels require each local GEMM dimension to be a multiple
+# of 128, on both the Triton and the CuteDSL backend.
 _NVFP4_BLOCK = 128
 
 # Fixed Random Hadamard Transform basis (the NVFP4 v1 recipe default in torchao
@@ -67,16 +67,16 @@ _HARDCODED_SIGN_VECTOR = (
 )
 
 try:
+    from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
+        cutedsl_nvfp4_kernels_available,
+        cutedsl_nvfp4_unavailable_reason,
+    )
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_grouped_mm import (
         _to_nvfp4_rht_rs_then_scaled_grouped_mm,
     )
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_linear import (
         nvfp4_linear,
-        nvfp4_mm_triton,
-    )
-    from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
-        cutedsl_nvfp4_kernels_available,
-        cutedsl_nvfp4_unavailable_reason,
+        nvfp4_matmul,
     )
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_training import (
         _make_rht_sign_vector,
@@ -110,31 +110,44 @@ try:
             )
         return pref
 
-    def _log_kernel_preference(what: str, pref: KernelPreference) -> None:
-        """Record the preference and the backend it actually resolves to.
+    def _log_kernel_preference(
+        what: str, pref: KernelPreference, use_fast_math: bool, per_op: bool
+    ) -> None:
+        """Record the quantization backend this recipe pins, and refuse to fall back.
 
-        AUTO is legitimate, but it must not be silent: the resolved backend is
-        what a later comparison against these numbers has to match.
+        The backend is a numerics decision, not only a speed one: the stochastic-
+        rounding streams differ between Triton and CuteDSL (torchao's own
+        ``test_nvfp4_linear_auto_runs_on_triton_fallback`` compares the two under
+        RTNE for exactly that reason). A run must therefore not discover its
+        backend from the container image, which is why CUTEDSL raises here, at
+        converter build, rather than at the first kernel call.
         """
         if pref is KernelPreference.CUTEDSL and not cutedsl_nvfp4_kernels_available():
             raise RuntimeError(
                 f"{what} kernel_preference=cutedsl, but the CuteDSL runtime is "
                 f"unavailable ({cutedsl_nvfp4_unavailable_reason()})."
             )
-        resolved = (
-            "triton"
-            if pref is KernelPreference.TRITON
-            else ("cutedsl" if cutedsl_nvfp4_kernels_available() else "triton")
-        )
         logger.info(
-            "%s kernel_preference=%s, resolved backend=%s", what, pref.value, resolved
+            "%s kernel_preference=%s, use_fast_math=%s", what, pref.value, use_fast_math
         )
+        if pref is KernelPreference.AUTO:
+            # Only AUTO leaves the backend undetermined by the recipe. No single
+            # "resolved" backend is reportable for the grouped path: it resolves
+            # per op, so one step can mix Triton and CuteDSL.
+            logger.warning(
+                "%s kernel_preference=auto: the backend follows the container, not "
+                "the recipe (%s), and the SR streams differ between backends.",
+                what,
+                "resolved per op"
+                if per_op
+                else ("cutedsl" if cutedsl_nvfp4_kernels_available() else "triton"),
+            )
 
     # The NVFP4 GEMM is a raw autograd Function that runs on local shards inside
     # the spmd.local_map region. Mark it local-safe so SPMD type checking
     # propagates through it; the local_map boundary declares the real
     # colwise/rowwise output and input-gradient types.
-    spmd.register_local_autograd_function(nvfp4_mm_triton)
+    spmd.register_local_autograd_function(nvfp4_matmul)
 
     class NVFP4Linear(TorchAONVFP4Linear, Module):
         """NVFP4 Linear satisfying torchtitan's Module protocol.
@@ -157,10 +170,10 @@ try:
             """Approximate-reciprocal RHT quantize, matching TE's NVTE_USE_FAST_MATH=1."""
 
             def __post_init__(self) -> None:
-                # NVFP4's Triton kernels need every GEMM dim to be a multiple of
-                # 128. in_features / out_features are known at config-build time
+                # NVFP4 needs every GEMM dim to be a multiple of 128 on either
+                # backend. in_features / out_features are known at config-build time
                 # (the TP degree is not), so reject the model-dim violations up
-                # front here; the AO kernel (nvfp4_mm_triton) itself raises on the
+                # front here; the AO kernel (nvfp4_matmul) itself raises on the
                 # per-rank local dims once TP has sharded the weight.
                 for name in ("in_features", "out_features"):
                     value = getattr(self, name)
@@ -215,18 +228,21 @@ try:
                     )
                 return instance
 
-        def __init__(self, config: Linear.Config):
+        def __init__(self, config: Config):
+            # Both flags go to the TorchAO base rather than into private copies:
+            # the base owns them (its own forward and from_linear read
+            # self.kernel_preference), and its default is AUTO, so a shadowing
+            # copy would leave every inherited path resolving by container.
+            # Validated here, once per module, so a bad recipe string fails at
+            # model build rather than at the first kernel call.
             TorchAONVFP4Linear.__init__(
                 self,
                 config.in_features,
                 config.out_features,
                 bias=config.bias,
+                kernel_preference=_to_kernel_preference(config.kernel_preference),
+                use_fast_math=config.use_fast_math,
             )
-            # Resolved once here rather than per forward: _resolve_use_cutedsl
-            # walks importlib.util.find_spec over four packages, and forward and
-            # backward must agree on the backend.
-            self._kernel_preference = _to_kernel_preference(config.kernel_preference)
-            self._use_fast_math = config.use_fast_math
             # TorchAO created the runtime buffers on the (meta) build device.
             # Re-register them as None so ``_distribute_states`` skips them and
             # ``_init_self_buffers`` materializes them on the real device, per
@@ -302,8 +318,8 @@ try:
                 self.bias,
                 sr_seed=self._sr_seed,
                 sign_vector=self.rht_sign_vector,
-                kernel_preference=self._kernel_preference,
-                use_fast_math=self._use_fast_math,
+                kernel_preference=self.kernel_preference,
+                use_fast_math=self.use_fast_math,
             )
 
 except ImportError:
@@ -375,8 +391,12 @@ class NVFP4LinearConverter(QuantizationConverter):
                 "of NVFP4 dynamic quantization."
             )
 
-        self._kernel_preference = _to_kernel_preference(self.config.kernel_preference)
-        _log_kernel_preference("NVFP4Linear", self._kernel_preference)
+        _log_kernel_preference(
+            "NVFP4Linear",
+            _to_kernel_preference(self.config.kernel_preference),
+            self.config.use_fast_math,
+            per_op=False,
+        )
 
     def convert(self, model_config):
         assert NVFP4Linear is not None
@@ -524,7 +544,7 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
         pad_multiple: int = 128
         """
         Pad per-expert token groups to this multiple for NVFP4 grouped GEMM
-        alignment. TorchAO's NVFP4 Triton kernels require multiples of 128.
+        alignment. TorchAO's NVFP4 kernels require multiples of 128.
         """
 
         kernel_preference: str = "cutedsl"
@@ -562,13 +582,20 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
             )
 
         self._kernel_preference = _to_kernel_preference(self.config.kernel_preference)
-        _log_kernel_preference("NVFP4GroupedExperts", self._kernel_preference)
+        _log_kernel_preference(
+            "NVFP4GroupedExperts",
+            self._kernel_preference,
+            self.config.use_fast_math,
+            per_op=True,
+        )
 
     def convert(self, model_config):
         fqns = self.config.fqns
+        num_experts = 0
         for fqn, config, parent, attr in model_config.traverse(GroupedExperts.Config):
             if fqns and not any(target_fqn in fqn for target_fqn in fqns):
                 continue
+            num_experts = max(num_experts, config.num_experts)
             # ``parent`` is the RoutedExperts.Config owning inner_experts + dispatcher.
             swap_token_dispatcher(parent, self.config.pad_multiple)
             base_module_cls = type(config)._owner
@@ -587,6 +614,26 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
                 parent[attr] = new_config
             else:
                 setattr(parent, attr, new_config)
+
+        if num_experts and self._kernel_preference is KernelPreference.CUTEDSL:
+            # The CuteDSL grouped RHT kernel caps the group count, and the count it
+            # sees is per rank: num_experts // expert_parallel_degree. That degree
+            # lives in ParallelismConfig, which a converter never receives, so the
+            # requirement can only be stated here -- torchao raises on the exact
+            # local count at the first grouped GEMM.
+            from torchao.prototype.moe_training.nvfp4_training._cutedsl_group_kernels_impl import (
+                MAX_GROUPS,
+            )
+
+            if num_experts > MAX_GROUPS:
+                logger.warning(
+                    "NVFP4GroupedExperts kernel_preference=cutedsl with %d experts "
+                    "requires expert_parallel_degree >= %d: the CuteDSL grouped "
+                    "kernel takes at most %d experts per rank and raises otherwise.",
+                    num_experts,
+                    math.ceil(num_experts / MAX_GROUPS),
+                    MAX_GROUPS,
+                )
 
         logger.info(
             "Converted GroupedExperts to use dynamic NVFP4 quantization for "

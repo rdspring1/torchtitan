@@ -18,6 +18,18 @@ from torchtitan.models.common.moe import GroupedExperts
 from torchtitan.models.gpt_oss.moe import GptOssGroupedExperts
 
 
+def _bypass_nvfp4_hardware_gates(monkeypatch, nvfp4_mod) -> None:
+    """Exercise the NVFP4 config-tree transform off a Blackwell box.
+
+    Both NVFP4 converters gate on two runtime facts when they are built: the sm100
+    check, and -- because kernel_preference defaults to cutedsl -- the CuteDSL
+    runtime probe, which raises rather than falling back to Triton. Neither is
+    relevant to the config transform under test.
+    """
+    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    monkeypatch.setattr(nvfp4_mod, "cutedsl_nvfp4_kernels_available", lambda: True)
+
+
 def test_no_float8_by_default():
     config_manager = ConfigManager()
     config = config_manager.parse_args(
@@ -68,7 +80,7 @@ def test_nvfp4_converter_targets_layers_not_lm_head(
     # config-tree transform under test).
     import torchtitan.components.quantization.nvfp4 as nvfp4_mod
 
-    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    _bypass_nvfp4_hardware_gates(monkeypatch, nvfp4_mod)
 
     config_manager = ConfigManager()
     config = config_manager.parse_args(["--module", module, "--config", recipe])
@@ -131,7 +143,7 @@ def test_nvfp4_first_85_pct_layers_converts_only_leading_layers(
 
     import torchtitan.components.quantization.nvfp4 as nvfp4_mod
 
-    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    _bypass_nvfp4_hardware_gates(monkeypatch, nvfp4_mod)
 
     config = ConfigManager().parse_args(["--module", module, "--config", recipe])
     model_config = config.model_spec.model
@@ -172,6 +184,34 @@ def test_nvfp4_config_rejects_non_128_dims(in_features, out_features):
     NVFP4Linear = _nvfp4_linear_cls()
     with pytest.raises(ValueError, match="divisible by 128"):
         NVFP4Linear.Config(in_features=in_features, out_features=out_features)
+
+
+def test_nvfp4_kernel_preference_reaches_the_module():
+    """The recipe's backend choice must land on the TorchAO base, not a private copy.
+
+    TorchAO's NVFP4Linear defaults kernel_preference to AUTO and reads it in its own
+    forward and from_linear, so a module that parked the choice on a separate
+    attribute would leave every inherited path resolving the backend from the
+    container image. That is a numerics difference, not just a speed one: the
+    stochastic-rounding streams differ between the Triton and CuteDSL backends.
+    """
+    NVFP4Linear = _nvfp4_linear_cls()
+    from torchao.quantization.quantize_.common import KernelPreference
+
+    module = NVFP4Linear.Config(
+        in_features=512,
+        out_features=512,
+        kernel_preference="triton",
+        use_fast_math=False,
+    ).build()
+    assert module.kernel_preference is KernelPreference.TRITON
+    assert module.use_fast_math is False
+
+    # Values torchao accepts but the NVFP4 paths do not must be rejected at build.
+    with pytest.raises(ValueError, match="kernel_preference must be one of"):
+        NVFP4Linear.Config(
+            in_features=512, out_features=512, kernel_preference="torch"
+        ).build()
 
 
 @pytest.mark.parametrize(
@@ -235,7 +275,7 @@ def test_nvfp4_recipes_default_to_spmd_types_and_allow_cli_override(
     _nvfp4_linear_cls()
     import torchtitan.components.quantization.nvfp4 as nvfp4_mod
 
-    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    _bypass_nvfp4_hardware_gates(monkeypatch, nvfp4_mod)
     base_args = ["--module", module, "--config", recipe]
 
     config = ConfigManager().parse_args(base_args)
@@ -259,7 +299,7 @@ def test_qwen3_recipes_resolve(monkeypatch, recipe):
     _nvfp4_linear_cls()
     import torchtitan.components.quantization.nvfp4 as nvfp4_mod
 
-    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    _bypass_nvfp4_hardware_gates(monkeypatch, nvfp4_mod)
     config = ConfigManager().parse_args(["--module", "qwen3", "--config", recipe])
     assert config.model_spec.name == "qwen3"
     if recipe == "qwen3_8b_first_85_pct_layers_nvfp4":
@@ -312,7 +352,7 @@ def test_nvfp4_hf_export_strips_buffers(monkeypatch):
     NVFP4Linear = _nvfp4_linear_cls()
     import torchtitan.components.quantization.nvfp4 as nvfp4_mod
 
-    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    _bypass_nvfp4_hardware_gates(monkeypatch, nvfp4_mod)
     from torchtitan.models.llama3.state_dict_adapter import Llama3StateDictAdapter
 
     config = ConfigManager().parse_args(
@@ -398,6 +438,8 @@ def test_nvfp4_grouped_experts_preserves_logical_tail_offset(monkeypatch):
     class RuntimeState:
         rht_sign_vector = (1,) * 16
         _sr_seed = torch.zeros(1, dtype=torch.int64)
+        _kernel_preference = nvfp4_mod.KernelPreference.CUTEDSL
+        _use_fast_math = True
 
     A = torch.empty(384, 128)
     B_t = torch.empty(2, 128, 128)
@@ -425,7 +467,7 @@ def test_nvfp4_grouped_experts_converter_targets_leading_moe_layers(monkeypatch)
     # converter __init__ enforces.
     import torchtitan.components.quantization.nvfp4 as nvfp4_mod
 
-    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    _bypass_nvfp4_hardware_gates(monkeypatch, nvfp4_mod)
 
     config_manager = ConfigManager()
     config = config_manager.parse_args(
@@ -492,9 +534,12 @@ def test_deepseek_v3_nvfp4_recipes_resolve(monkeypatch, recipe):
 
     if NVFP4Linear is None:
         pytest.skip("torchao NVFP4 training prototype not available")
+    import torchtitan.components.quantization.mx as mx_mod
     import torchtitan.components.quantization.nvfp4 as nvfp4_mod
 
-    monkeypatch.setattr(nvfp4_mod, "has_cuda_capability", lambda *_: True)
+    _bypass_nvfp4_hardware_gates(monkeypatch, nvfp4_mod)
+    # The mixed flavors also carry an MXFP8LinearConverter, which gates on sm100.
+    monkeypatch.setattr(mx_mod, "has_cuda_capability", lambda *_: True)
     config = ConfigManager().parse_args(["--module", "deepseek_v3", "--config", recipe])
     assert config.model_spec.name == "deepseek_v3"
     assert has_quantization(config.model_spec.model)
