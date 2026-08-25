@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from functools import partial
+
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
@@ -229,7 +231,7 @@ def deepseek_v3_16b_hybridep() -> Trainer.Config:
     return config
 
 
-def deepseek_v3_16b_nvfp4() -> Trainer.Config:
+def deepseek_v3_16b_nvfp4(bf16_tail_fraction: float = 0.0) -> Trainer.Config:
     config = deepseek_v3_16b()
     assert config.model_spec is not None
     # Assign compile BEFORE deriving the flag, matching
@@ -252,20 +254,22 @@ def deepseek_v3_16b_nvfp4() -> Trainer.Config:
     # attention stays bf16. pad_multiple=128 is required by the NVFP4 grouped-mm
     # kernel on sm_100.
     #
-    # F0L0: no bf16 tail. Was 0.15, i.e. ceil(27 * 0.15) = 5 trailing layers held
-    # in bf16 (F0L5). MLPerf's DSV3-671B FP4 config sets neither
-    # num_layers_at_start_in_bf16 nor num_layers_at_end_in_bf16, so F0L0 is the
-    # reference recipe, and the 671B config here moves with it -- this arm exists
-    # to validate what 671B will actually run, so a more conservative holdout at
-    # 16B would test something we do not ship.
+    # Default 0.0 (F0L0, no bf16 tail): MLPerf's DSV3-671B FP4 config sets
+    # neither num_layers_at_start_in_bf16 nor num_layers_at_end_in_bf16, so F0L0
+    # is the reference recipe and the 671B config here moves with it -- this arm
+    # exists to validate what 671B will actually run.
+    #
+    # A parameter rather than a module constant because eight recipe products
+    # call this with the default, five of them the 16B M-sweep throughput
+    # probes; changing the default reprices all of them. See
+    # deepseek_v3_16b_nvfp4_f0l5 below.
     #
     # ceil(0) = 0 leaves convert_upto = n_layers, which does NOT trip the
     # convert_upto <= 0 guard in nvfp4_bf16_tail_fqns; layer 0 is still excluded
     # separately because 16B's dense FeedForward is 2048 -> 10944 and
     # 10944 % 128 == 64, so it cannot be NVFP4.
     n_layers = len(config.model_spec.model.layers)
-    _NVFP4_BF16_TAIL_FRACTION = 0.0
-    fqns = nvfp4_bf16_tail_fqns(n_layers, _NVFP4_BF16_TAIL_FRACTION)
+    fqns = nvfp4_bf16_tail_fqns(n_layers, bf16_tail_fraction)
     config.model_spec = model_registry(
         "16B",
         attn_backend="flex",
@@ -304,6 +308,16 @@ def deepseek_v3_16b_nvfp4() -> Trainer.Config:
         ],
     )
     return config
+
+
+# E11. F0L5: ceil(27 * 0.15) = 5 trailing layers held in bf16, so NVFP4 covers
+# MoE layers 1-21 and layers 22-26 revert -- 5 of 26 MoE layers, 19.2%. Tests
+# whether a bf16 tail recovers the +0.049-nat gap E03 (F0L0) finished with.
+# A partial rather than a copy of the function, so the only thing that can
+# differ between the two arms is the number in the name. ConfigManager resolves
+# config_name with getattr + callable (config/manager.py:144), which a partial
+# satisfies.
+deepseek_v3_16b_nvfp4_f0l5 = partial(deepseek_v3_16b_nvfp4, bf16_tail_fraction=0.15)
 
 
 def deepseek_v3_16b_minimal_async_ep() -> Trainer.Config:
