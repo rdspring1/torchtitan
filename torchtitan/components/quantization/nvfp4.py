@@ -18,13 +18,17 @@ reduce-scatter); NVFP4 does not move fp4 codes over the wire.
 
 import math
 from dataclasses import dataclass, field, fields, replace
-from typing import cast
+from typing import Literal, cast
 
 import spmd_types as spmd
 import torch
+import torch.nn.functional as F
+from torch.distributed.tensor import DTensor
 
 from torchtitan.components.quantization import QuantizationConverter
 from torchtitan.distributed.parallel_dims import MeshAxisName
+from torchtitan.distributed.spmd_types import spmd_mesh_size
+from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.decoder_sharding import dense_activation_placement
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import GroupedExperts
@@ -422,6 +426,31 @@ class NVFP4LinearConverter(QuantizationConverter):
         return model_config
 
 
+# NVFP4 recipes available to the MoE path. "v1" is the shipped recipe and stays
+# the default for both FFN layers, so an unchanged config produces exactly what it
+# produced before the other two existed. Design doc §17 recommends FC1 (w1 gate,
+# w3 up) on "v1_requant" and FC2 (w2 down) on "v2"; that split is a configuration
+# choice, not a hard-coded assumption, and the recipes may be swapped.
+_NVFP4_RECIPES = ("v1", "v1_requant", "v2")
+
+# V2 rotates by RHT-128 rather than RHT-16.
+_V2_RHT_SIZE = 128
+
+
+def _draw_sign_vector(length: int, seed: int, device) -> torch.Tensor:
+    """Deterministic {-1, +1} int8 vector, identical on every rank for a given seed.
+
+    Derived rather than broadcast, for the same reason ``_HARDCODED_SIGN_VECTOR`` is
+    hardcoded: the RHT only cancels between the two operands of a GEMM when both were
+    rotated by the same basis, and under EP those operands can live on different
+    ranks. Deriving from a fixed seed makes them agree by construction, with no
+    collective.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    bits = torch.randint(0, 2, (length,), generator=generator, dtype=torch.int8)
+    return (bits * 2 - 1).to(device)
+
+
 _nvfp4_experts_cache: dict[type, type] = {}
 
 
@@ -452,16 +481,48 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
             use_fast_math: bool = True
             """Approximate-reciprocal RHT quantize, matching TE's NVTE_USE_FAST_MATH=1."""
 
+            fc1_recipe: str = "v1"
+            """NVFP4 recipe for the FC1 gate/up GEMMs (``w1``, ``w3``)."""
+
+            fc2_recipe: str = "v1"
+            """NVFP4 recipe for the FC2 down GEMM (``w2``)."""
+
         def __init__(self, config: Config):
             super().__init__(config)
             self._kernel_preference = _to_kernel_preference(config.kernel_preference)
             self._use_fast_math = config.use_fast_math
+            for name in ("fc1_recipe", "fc2_recipe"):
+                value = getattr(config, name)
+                if value not in _NVFP4_RECIPES:
+                    raise ValueError(
+                        f"{name} must be one of {_NVFP4_RECIPES}, got {value!r}"
+                    )
+            self._fc1_recipe = config.fc1_recipe
+            self._fc2_recipe = config.fc2_recipe
+            # V1_REQUANT and V2 are Triton-only for now; the CuteDSL grouped kernels
+            # exist for V1 alone. Raise rather than silently downgrade the backend.
+            if (
+                self._fc1_recipe != "v1" or self._fc2_recipe != "v1"
+            ) and self._kernel_preference is KernelPreference.CUTEDSL:
+                raise ValueError(
+                    "kernel_preference='cutedsl' is only available for recipe 'v1'; "
+                    f"got fc1_recipe={self._fc1_recipe!r}, "
+                    f"fc2_recipe={self._fc2_recipe!r}. Use 'triton'."
+                )
             # Same buffer protocol as NVFP4Linear.__init__: register the runtime
             # buffers as None so _distribute_states skips them and
             # _init_self_buffers materializes them per rank on the real device.
             self.register_buffer("_sr_seed", None, persistent=False)
             self.register_buffer("_rht_sign_vector", None, persistent=False)
             self._rht_sign_vector_tuple = None
+            # Once FC1 and FC2 run different recipes they no longer share a
+            # quantization path, so they must not share a seed or a sign vector:
+            # correlated noise between them defeats the point of drawing either.
+            # Registered unconditionally so the buffer set does not depend on the
+            # recipe, which keeps _distribute_states and meta-init uniform.
+            self.register_buffer("_fc2_sr_seed", None, persistent=False)
+            self.register_buffer("_fc2_rht_sign_vector", None, persistent=False)
+            self.register_buffer("_fc2_dgrad_rht_sign_vector", None, persistent=False)
 
         def _local_rht_sign_vector(self) -> torch.Tensor:
             sign_vector = self._rht_sign_vector
@@ -507,11 +568,30 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
                 _HARDCODED_SIGN_VECTOR, device=dev
             )
             self._refresh_rht_sign_vector_tuple()
+            # Per-rank, like _sr_seed, and distinct from it.
+            self._fc2_sr_seed = torch.randint(
+                -9_223_372_036_854_775_808,
+                9_223_372_036_854_775_807,
+                (1,),
+                dtype=torch.int64,
+                device=dev,
+            )
+            # Fixed shape and updated in place by torchao's
+            # resample_nvfp4_rht_signs, so the addresses survive CUDA-graph capture.
+            self._fc2_rht_sign_vector = _draw_sign_vector(_V2_RHT_SIZE, 0xFC2, dev)
+            self._fc2_dgrad_rht_sign_vector = _draw_sign_vector(
+                _V2_RHT_SIZE, 0xDEAD, dev
+            )
 
         def _grouped_mm(self, *, A, B_t, offs):
             # torchao's NVFP4 grouped MM takes the un-transposed weight B (E, N, K)
             # and uses the final dispatcher offset as the logical token bound. A may
             # have additional allocation capacity, which torchao leaves untouched.
+            #
+            # This is the V1 seam and stays the path for the default configuration.
+            # The seam takes (A, B_t, offs) and so cannot tell the three call sites
+            # apart; the per-layer recipe split therefore lives in forward() below,
+            # which is the last place FC1 and FC2 are still distinguishable.
             return _to_nvfp4_rht_rs_then_scaled_grouped_mm(
                 A,
                 B_t.transpose(-2, -1),
@@ -522,6 +602,94 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
                 kernel_preference=self._kernel_preference,
                 use_fast_math=self._use_fast_math,
             )
+
+        def _recipe_grouped_mm(self, recipe, A, B, offs, *, is_fc2):
+            """One grouped GEMM under ``recipe``. ``B`` is un-transposed (E, N, K)."""
+            from torchao.prototype.moe_training.nvfp4_training.nvfp4_grouped_mm_v2 import (
+                nvfp4_v1_requant_grouped_mm,
+                nvfp4_v2_grouped_mm,
+            )
+
+            seed = self._fc2_sr_seed if is_fc2 else self._sr_seed
+            if recipe == "v1":
+                return _to_nvfp4_rht_rs_then_scaled_grouped_mm(
+                    A,
+                    B,
+                    self.rht_sign_vector,
+                    seed,
+                    offs=offs,
+                    pad_token_groups_for_grouped_mm=False,
+                    kernel_preference=self._kernel_preference,
+                    use_fast_math=self._use_fast_math,
+                )
+            if recipe == "v1_requant":
+                return nvfp4_v1_requant_grouped_mm(
+                    A,
+                    B,
+                    sign_vector=self.rht_sign_vector,
+                    sr_seed=seed,
+                    offs=offs,
+                    pad_token_groups_for_grouped_mm=False,
+                    use_fast_math=self._use_fast_math,
+                )
+            return nvfp4_v2_grouped_mm(
+                A,
+                B,
+                wgrad_rht=self._fc2_rht_sign_vector,
+                dgrad_rht=self._fc2_dgrad_rht_sign_vector,
+                sr_seed=seed,
+                offs=offs,
+                pad_token_groups_for_grouped_mm=False,
+                use_fast_math=self._use_fast_math,
+            )
+
+        def forward(self, x_RD, num_tokens_per_expert_E):
+            if self._fc1_recipe == "v1" and self._fc2_recipe == "v1":
+                # Default configuration: fall through to the parent's forward, which
+                # reaches NVFP4 through the _grouped_mm seam above. Keeping the common
+                # case on the parent's code path means the DTensor/spmd preamble is
+                # not duplicated and stays in sync.
+                return super().forward(x_RD, num_tokens_per_expert_E)
+
+            if isinstance(self.w1_EFD, DTensor):
+                # Same reason as the parent: EP's dynamic shapes are not expressible
+                # as DTensors, so the grouped GEMM runs on plain local tensors.
+                w1_EFD = self.w1_EFD.to_local()
+                w2_EDF = self.w2_EDF.to_local()
+                w3_EFD = self.w3_EFD.to_local()
+            else:
+                w1_EFD, w2_EDF, w3_EFD = self.w1_EFD, self.w2_EDF, self.w3_EFD
+
+            offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
+            if (
+                get_spmd_backend() == "spmd_types"
+                and spmd.is_type_checking()
+                and spmd_mesh_size("ep") == 1
+            ):
+                for axis in ("dp", "cp"):
+                    spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
+
+            # Weights go in as stored: torchao takes B un-transposed as (E, N, K),
+            # the opposite of the seam's B_t.
+            gate = self._recipe_grouped_mm(
+                self._fc1_recipe,
+                x_RD.bfloat16(),
+                w1_EFD.bfloat16(),
+                offsets_E,
+                is_fc2=False,
+            )
+            up = self._recipe_grouped_mm(
+                self._fc1_recipe,
+                x_RD.bfloat16(),
+                w3_EFD.bfloat16(),
+                offsets_E,
+                is_fc2=False,
+            )
+            h_RF = F.silu(gate) * up
+            out = self._recipe_grouped_mm(
+                self._fc2_recipe, h_RF, w2_EDF.bfloat16(), offsets_E, is_fc2=True
+            )
+            return out.type_as(x_RD)
 
     NVFP4GroupedExperts.__name__ = f"NVFP4{parent_cls.__name__}"
     NVFP4GroupedExperts.__qualname__ = f"NVFP4{parent_cls.__name__}"
@@ -558,6 +726,17 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
 
         use_fast_math: bool = True
         """Approximate-reciprocal RHT quantize, matching TE's NVTE_USE_FAST_MATH=1."""
+
+        fc1_recipe: Literal["v1", "v1_requant", "v2"] = "v1"
+        """NVFP4 recipe for the FC1 gate/up GEMMs (``w1``, ``w3``).
+
+        Defaults to "v1" so an unchanged config is unaffected by this option's
+        existence. Design doc §17 recommends "v1_requant" here and "v2" for FC2.
+        Both non-v1 recipes require kernel_preference="triton".
+        """
+
+        fc2_recipe: Literal["v1", "v1_requant", "v2"] = "v1"
+        """NVFP4 recipe for the FC2 down GEMM (``w2``). See ``fc1_recipe``."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -608,6 +787,8 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
             # only, so the two NVFP4-specific ones are set explicitly.
             new_config.kernel_preference = self.config.kernel_preference
             new_config.use_fast_math = self.config.use_fast_math
+            new_config.fc1_recipe = self.config.fc1_recipe
+            new_config.fc2_recipe = self.config.fc2_recipe
             if parent is None:
                 model_config = new_config
             elif isinstance(parent, list):

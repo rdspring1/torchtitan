@@ -3,6 +3,8 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+import dataclasses
+
 import pytest
 import spmd_types as spmd
 import torch
@@ -14,7 +16,8 @@ from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.config import ConfigManager
 from torchtitan.models.common.decoder_sharding import colwise_config, rowwise_config
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.moe import GroupedExperts
+from torchtitan.models.common.moe import GroupedExperts, RoutedExperts
+from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.models.gpt_oss.moe import GptOssGroupedExperts
 
 
@@ -543,3 +546,210 @@ def test_deepseek_v3_nvfp4_recipes_resolve(monkeypatch, recipe):
     config = ConfigManager().parse_args(["--module", "deepseek_v3", "--config", recipe])
     assert config.model_spec.name == "deepseek_v3"
     assert has_quantization(config.model_spec.model)
+
+
+def _nvfp4_experts_or_skip():
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    if nvfp4_mod.NVFP4Linear is None:
+        pytest.skip("torchao NVFP4 training prototype not available")
+    return nvfp4_mod
+
+
+def test_nvfp4_grouped_experts_default_to_v1_on_both_layers():
+    """The recipe knobs must not change what an unchanged config does.
+
+    Both default to "v1", and in that case ``forward`` delegates straight to the
+    parent's, so the default configuration still reaches NVFP4 through the
+    ``_grouped_mm`` seam and the DTensor/spmd preamble is not duplicated.
+    """
+    pytest.importorskip("torchao")
+    nvfp4_mod = _nvfp4_experts_or_skip()
+    cls = nvfp4_mod._get_nvfp4_grouped_experts_cls(GroupedExperts)
+    defaults = {f.name: f.default for f in dataclasses.fields(cls.Config)}
+    assert defaults["fc1_recipe"] == "v1"
+    assert defaults["fc2_recipe"] == "v1"
+    converter_defaults = {
+        f.name: f.default
+        for f in dataclasses.fields(nvfp4_mod.NVFP4GroupedExpertsConverter.Config)
+    }
+    assert converter_defaults["fc1_recipe"] == "v1"
+    assert converter_defaults["fc2_recipe"] == "v1"
+
+
+@pytest.mark.parametrize("field_name", ["fc1_recipe", "fc2_recipe"])
+def test_nvfp4_grouped_experts_reject_an_unknown_recipe(field_name):
+    pytest.importorskip("torchao")
+    nvfp4_mod = _nvfp4_experts_or_skip()
+    cls = nvfp4_mod._get_nvfp4_grouped_experts_cls(GroupedExperts)
+    config = cls.Config(
+        dim=256,
+        hidden_dim=512,
+        num_experts=2,
+        kernel_preference="triton",
+        **{field_name: "v3"},
+    )
+    with pytest.raises(ValueError, match=f"{field_name} must be one of"):
+        config.build()
+
+
+def test_nvfp4_non_v1_recipes_reject_cutedsl():
+    """V1_REQUANT and V2 are Triton-only; the CuteDSL grouped kernels exist for V1
+    alone. Raise rather than silently downgrading the backend, which would leave the
+    run slower than requested with no indication why."""
+    pytest.importorskip("torchao")
+    nvfp4_mod = _nvfp4_experts_or_skip()
+    cls = nvfp4_mod._get_nvfp4_grouped_experts_cls(GroupedExperts)
+    config = cls.Config(
+        dim=256,
+        hidden_dim=512,
+        num_experts=2,
+        kernel_preference="cutedsl",
+        fc1_recipe="v1_requant",
+        fc2_recipe="v2",
+    )
+    with pytest.raises(ValueError, match="only available for recipe 'v1'"):
+        config.build()
+
+
+def test_nvfp4_split_recipe_routes_each_layer_to_its_own_entrypoint(monkeypatch):
+    """Design doc §17: FC1 (w1, w3) on V1_REQUANT, FC2 (w2) on V2.
+
+    The reason ``forward`` is overridden at all: the ``_grouped_mm`` seam takes
+    ``(A, B_t, offs)`` and cannot tell the three call sites apart, so a per-layer
+    recipe split cannot be expressed through it.
+    """
+    pytest.importorskip("torchao")
+    nvfp4_mod = _nvfp4_experts_or_skip()
+
+    calls = []
+
+    def v1_requant_stub(A, B, **kwargs):
+        calls.append(("v1_requant", tuple(B.shape)))
+        return torch.zeros(A.shape[0], B.shape[1])
+
+    def v2_stub(A, B, **kwargs):
+        calls.append(("v2", tuple(B.shape)))
+        return torch.zeros(A.shape[0], B.shape[1])
+
+    import torchao.prototype.moe_training.nvfp4_training.nvfp4_grouped_mm_v2 as v2_mod
+
+    monkeypatch.setattr(v2_mod, "nvfp4_v1_requant_grouped_mm", v1_requant_stub)
+    monkeypatch.setattr(v2_mod, "nvfp4_v2_grouped_mm", v2_stub)
+
+    cls = nvfp4_mod._get_nvfp4_grouped_experts_cls(GroupedExperts)
+    module = cls.Config(
+        dim=128,
+        hidden_dim=256,
+        num_experts=2,
+        kernel_preference="triton",
+        fc1_recipe="v1_requant",
+        fc2_recipe="v2",
+    ).build()
+    module._init_self_buffers(buffer_device=torch.device("cpu"))
+
+    x = torch.zeros(256, 128)
+    module(x, torch.tensor([128, 128], dtype=torch.int32))
+
+    recipes = [name for name, _ in calls]
+    assert recipes == ["v1_requant", "v1_requant", "v2"], (
+        f"expected FC1 gate/up on v1_requant and FC2 down on v2, got {recipes}"
+    )
+    # Weights reach torchao un-transposed as (E, N, K) -- the opposite of the seam's
+    # B_t -- so w1/w3 arrive as (E, hidden, dim) and w2 as (E, dim, hidden).
+    assert calls[0][1] == (2, 256, 128) and calls[1][1] == (2, 256, 128)
+    assert calls[2][1] == (2, 128, 256)
+
+
+def test_nvfp4_fc1_and_fc2_state_is_independent():
+    """§17: once the two layers run different recipes they no longer share a
+    quantization path, so a shared seed or sign vector would correlate their noise."""
+    pytest.importorskip("torchao")
+    nvfp4_mod = _nvfp4_experts_or_skip()
+    cls = nvfp4_mod._get_nvfp4_grouped_experts_cls(GroupedExperts)
+    module = cls.Config(
+        dim=128, hidden_dim=256, num_experts=2, kernel_preference="triton"
+    ).build()
+    module._init_self_buffers(buffer_device=torch.device("cpu"))
+
+    assert module._sr_seed.item() != module._fc2_sr_seed.item()
+    # V2 is RHT-128 where V1/V1_REQUANT are RHT-16.
+    assert module._rht_sign_vector.numel() == 16
+    assert module._fc2_rht_sign_vector.numel() == 128
+    assert module._fc2_dgrad_rht_sign_vector.numel() == 128
+    assert not torch.equal(
+        module._fc2_rht_sign_vector, module._fc2_dgrad_rht_sign_vector
+    )
+    for buffer in (module._fc2_rht_sign_vector, module._fc2_dgrad_rht_sign_vector):
+        assert set(buffer.tolist()) <= {-1, 1}
+    # None of the NVFP4 runtime buffers is checkpointed.
+    persistent = dict(module.named_buffers())
+    state = module.state_dict()
+    for name in (
+        "_sr_seed",
+        "_fc2_sr_seed",
+        "_rht_sign_vector",
+        "_fc2_rht_sign_vector",
+        "_fc2_dgrad_rht_sign_vector",
+    ):
+        assert name in persistent
+        assert name not in state
+
+
+def test_nvfp4_v2_sign_buffers_resample_in_place():
+    """torchao's cadence manager must find these buffers and update them in place.
+
+    Fixed shape and stable addresses are what let a CUDA graph captured around the
+    training step survive a resample.
+    """
+    pytest.importorskip("torchao")
+    nvfp4_mod = _nvfp4_experts_or_skip()
+    from torchao.prototype.moe_training.nvfp4_training.nvfp4_rht_cadence import (
+        resample_nvfp4_rht_signs,
+    )
+
+    cls = nvfp4_mod._get_nvfp4_grouped_experts_cls(GroupedExperts)
+    module = cls.Config(
+        dim=128, hidden_dim=256, num_experts=2, kernel_preference="triton"
+    ).build()
+    module._init_self_buffers(buffer_device=torch.device("cpu"))
+
+    wgrad, dgrad = module._fc2_rht_sign_vector, module._fc2_dgrad_rht_sign_vector
+    pointers = (wgrad.data_ptr(), dgrad.data_ptr())
+
+    # Two 128-element buffers; the 16-element V1 vector is static and untouched.
+    static_before = module._rht_sign_vector.clone()
+    assert resample_nvfp4_rht_signs(module, seed=3, step=0, microbatch=0) == 2
+    assert torch.equal(static_before, module._rht_sign_vector)
+
+    first_w, first_d = wgrad.clone(), dgrad.clone()
+    resample_nvfp4_rht_signs(module, seed=3, step=0, microbatch=1)
+    assert not torch.equal(first_w, wgrad), "wgrad resamples per microbatch"
+    assert torch.equal(first_d, dgrad), "dgrad holds across a step's microbatches"
+
+    resample_nvfp4_rht_signs(module, seed=3, step=1, microbatch=0)
+    assert not torch.equal(first_d, dgrad), "dgrad resamples per optimizer step"
+
+    assert (wgrad.data_ptr(), dgrad.data_ptr()) == pointers
+
+
+def test_nvfp4_grouped_converter_passes_recipes_through(monkeypatch):
+    pytest.importorskip("torchao")
+    nvfp4_mod = _nvfp4_experts_or_skip()
+    _bypass_nvfp4_hardware_gates(monkeypatch, nvfp4_mod)
+
+    converter = nvfp4_mod.NVFP4GroupedExpertsConverter(
+        nvfp4_mod.NVFP4GroupedExpertsConverter.Config(
+            model_compile_enabled=True,
+            kernel_preference="triton",
+            fc1_recipe="v1_requant",
+            fc2_recipe="v2",
+        )
+    )
+    routed = RoutedExperts.Config(
+        inner_experts=GroupedExperts.Config(dim=128, hidden_dim=256, num_experts=2),
+        token_dispatcher=AllToAllTokenDispatcher.Config(num_experts=2, top_k=1),
+    )
+    converter.convert(routed)
+    assert routed.inner_experts.fc1_recipe == "v1_requant"
+    assert routed.inner_experts.fc2_recipe == "v2"
