@@ -231,7 +231,9 @@ def deepseek_v3_16b_hybridep() -> Trainer.Config:
     return config
 
 
-def deepseek_v3_16b_nvfp4(bf16_tail_fraction: float = 0.0) -> Trainer.Config:
+def deepseek_v3_16b_nvfp4(
+    bf16_tail_fraction: float = 0.0, recipe: str = "v1"
+) -> Trainer.Config:
     config = deepseek_v3_16b()
     assert config.model_spec is not None
     # Assign compile BEFORE deriving the flag, matching
@@ -270,6 +272,12 @@ def deepseek_v3_16b_nvfp4(bf16_tail_fraction: float = 0.0) -> Trainer.Config:
     # 10944 % 128 == 64, so it cannot be NVFP4.
     n_layers = len(config.model_spec.model.layers)
     fqns = nvfp4_bf16_tail_fqns(n_layers, bf16_tail_fraction)
+    # V1_REQUANT has no CuteDSL grouped kernels, and both converters raise rather
+    # than downgrade, so the backend follows the recipe -- it is not a second knob.
+    # Deliberately left UNSET for "v1": deepseek_v3_16b_nvfp4_triton flips the
+    # backend by patching the Config class default, and an explicit kwarg at the
+    # call site would win over that patch.
+    backend = {} if recipe == "v1" else {"kernel_preference": "triton"}
     config.model_spec = model_registry(
         "16B",
         attn_backend="flex",
@@ -285,11 +293,16 @@ def deepseek_v3_16b_nvfp4(bf16_tail_fraction: float = 0.0) -> Trainer.Config:
             NVFP4LinearConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=_nvfp4_ffn_linear_fqns(fqns, _NVFP4_FFN_SUBMODULES_NO_DENSE),
+                recipe=recipe,
+                **backend,
             ),
             NVFP4GroupedExpertsConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=fqns,
                 pad_multiple=128,
+                fc1_recipe=recipe,
+                fc2_recipe=recipe,
+                **backend,
             ),
             # Attention in MXFP8, matching deepseek_v3_671b_nvfp4_mixed. This arm
             # exists to de-risk the 671B recipe, so the set of quantized modules
@@ -318,6 +331,12 @@ def deepseek_v3_16b_nvfp4(bf16_tail_fraction: float = 0.0) -> Trainer.Config:
 # config_name with getattr + callable (config/manager.py:144), which a partial
 # satisfies.
 deepseek_v3_16b_nvfp4_f0l5 = partial(deepseek_v3_16b_nvfp4, bf16_tail_fraction=0.15)
+
+# E12. The V1-Requantization recipe at 16B, the 2-node debug arm for E13. Its
+# weight path is 1x16 rowwise plus lazy requantization instead of V1's 16x16 2D
+# scaling, so its loss must DIFFER from the V1 arm -- an identical curve means
+# the recipe never reached the converters.
+deepseek_v3_16b_nvfp4_v1_requant = partial(deepseek_v3_16b_nvfp4, recipe="v1_requant")
 
 
 def deepseek_v3_16b_minimal_async_ep() -> Trainer.Config:
@@ -407,7 +426,7 @@ def deepseek_v3_671b_12_layers_nvfp4_mixed() -> Trainer.Config:
     return config
 
 
-def deepseek_v3_671b_nvfp4_mixed() -> Trainer.Config:
+def deepseek_v3_671b_nvfp4_mixed(recipe: str = "v1") -> Trainer.Config:
     config = deepseek_v3_671b()
     assert config.model_spec is not None
     config.compile = CompileConfig(enable=True, components=["model", "loss"])
@@ -430,6 +449,12 @@ def deepseek_v3_671b_nvfp4_mixed() -> Trainer.Config:
     # a 340-step horizon -- but F0L0 + mxfp8 projections is a new cell.
     n_layers = len(config.model_spec.model.layers)
     fqns = nvfp4_bf16_tail_fqns(n_layers, 0.0)
+    # V1_REQUANT has no CuteDSL grouped kernels, and both converters raise rather
+    # than downgrade, so the backend follows the recipe -- it is not a second knob.
+    # Deliberately left UNSET for "v1", matching deepseek_v3_16b_nvfp4: an explicit
+    # kwarg here would win over the Config-default patching that
+    # deepseek_v3_16b_nvfp4_triton relies on, and the two functions stay symmetric.
+    backend = {} if recipe == "v1" else {"kernel_preference": "triton"}
     config.model_spec = model_registry(
         "671B",
         attn_backend="flex",
@@ -455,11 +480,16 @@ def deepseek_v3_671b_nvfp4_mixed() -> Trainer.Config:
             NVFP4LinearConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=_nvfp4_ffn_linear_fqns(fqns, _NVFP4_FFN_SUBMODULES),
+                recipe=recipe,
+                **backend,
             ),
             NVFP4GroupedExpertsConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=fqns,
                 pad_multiple=128,
+                fc1_recipe=recipe,
+                fc2_recipe=recipe,
+                **backend,
             ),
             # Attention in MXFP8, not NVFP4. The shapes would permit NVFP4 --
             # wq_a 7168->1536, wq_b 1536->24576 and wo 16384->7168 are all
@@ -483,6 +513,15 @@ def deepseek_v3_671b_nvfp4_mixed() -> Trainer.Config:
         ],
     )
     return config
+
+
+# E13. The V1-Requantization recipe on the reference 671B arm -- F0L0 FFN plus
+# MXFP8 attention, unchanged. A partial rather than a copy so the two arms cannot
+# drift in anything but the recipe string; ConfigManager resolves config_name with
+# getattr + callable (config/manager.py:144), which a partial satisfies.
+deepseek_v3_671b_nvfp4_v1_requant = partial(
+    deepseek_v3_671b_nvfp4_mixed, recipe="v1_requant"
+)
 
 
 def deepseek_v3_671b_float8() -> Trainer.Config:

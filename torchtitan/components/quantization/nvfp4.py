@@ -451,7 +451,7 @@ class NVFP4LinearConverter(QuantizationConverter):
             )
 
         _log_kernel_preference(
-            "NVFP4Linear",
+            f"NVFP4Linear recipe={self.config.recipe}",
             _to_kernel_preference(self.config.kernel_preference),
             self.config.use_fast_math,
             per_op=False,
@@ -821,7 +821,8 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
 
         self._kernel_preference = _to_kernel_preference(self.config.kernel_preference)
         _log_kernel_preference(
-            "NVFP4GroupedExperts",
+            f"NVFP4GroupedExperts fc1={self.config.fc1_recipe} "
+            f"fc2={self.config.fc2_recipe}",
             self._kernel_preference,
             self.config.use_fast_math,
             per_op=True,
