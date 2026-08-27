@@ -82,6 +82,11 @@ try:
         nvfp4_linear,
         nvfp4_matmul,
     )
+    from torchao.prototype.moe_training.nvfp4_training.nvfp4_linear_v2 import (
+        _NVFP4LinearV1Requant,
+        nvfp4_linear_v1_requant,
+    )
+    from torchao.prototype.moe_training.nvfp4_training.nvfp4_recipe import NVFP4Recipe
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_training import (
         _make_rht_sign_vector,
         _rht_sign_vector_to_tuple,
@@ -152,6 +157,10 @@ try:
     # propagates through it; the local_map boundary declares the real
     # colwise/rowwise output and input-gradient types.
     spmd.register_local_autograd_function(nvfp4_matmul)
+    # V1_REQUANT's forward is a second raw autograd Function reached from the same
+    # local_map region, so it needs the same declaration or SPMD type checking stops
+    # at it.
+    spmd.register_local_autograd_function(_NVFP4LinearV1Requant)
 
     class NVFP4Linear(TorchAONVFP4Linear, Module):
         """NVFP4 Linear satisfying torchtitan's Module protocol.
@@ -173,7 +182,15 @@ try:
             use_fast_math: bool = True
             """Approximate-reciprocal RHT quantize, matching TE's NVTE_USE_FAST_MATH=1."""
 
+            recipe: str = "v1"
+            """NVFP4 recipe: "v1" or "v1_requant". See _NVFP4_LINEAR_RECIPES."""
+
             def __post_init__(self) -> None:
+                if self.recipe not in _NVFP4_LINEAR_RECIPES:
+                    raise ValueError(
+                        f"recipe must be one of {_NVFP4_LINEAR_RECIPES}, "
+                        f"got {self.recipe!r}"
+                    )
                 # NVFP4 needs every GEMM dim to be a multiple of 128 on either
                 # backend. in_features / out_features are known at config-build time
                 # (the TP degree is not), so reject the model-dim violations up
@@ -246,7 +263,18 @@ try:
                 bias=config.bias,
                 kernel_preference=_to_kernel_preference(config.kernel_preference),
                 use_fast_math=config.use_fast_math,
+                recipe=NVFP4Recipe(config.recipe),
             )
+            # V1_REQUANT is Triton-only; the CuteDSL kernels exist for V1 alone.
+            # Raise rather than silently downgrade, matching the grouped converter.
+            if (
+                config.recipe != "v1"
+                and self.kernel_preference is KernelPreference.CUTEDSL
+            ):
+                raise ValueError(
+                    "kernel_preference='cutedsl' is only available for recipe 'v1'; "
+                    f"got recipe={config.recipe!r}. Use 'triton'."
+                )
             # TorchAO created the runtime buffers on the (meta) build device.
             # Re-register them as None so ``_distribute_states`` skips them and
             # ``_init_self_buffers`` materializes them on the real device, per
@@ -316,6 +344,18 @@ try:
             self._refresh_rht_sign_vector_tuple()
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # Dispatched here rather than deferred to the TorchAO base: the base's
+            # forward also carries the process_group TP protocol, which this class
+            # does not use -- TP here is spmd local_map sharding instead.
+            if self.recipe is not NVFP4Recipe.V1:
+                return nvfp4_linear_v1_requant(
+                    x,
+                    self.weight,
+                    self.bias,
+                    sign_vector=self.rht_sign_vector,
+                    sr_seed=self._sr_seed,
+                    use_fast_math=self.use_fast_math,
+                )
             return nvfp4_linear(
                 x,
                 self.weight,
@@ -376,6 +416,21 @@ class NVFP4LinearConverter(QuantizationConverter):
         use_fast_math: bool = True
         """Approximate-reciprocal RHT quantize, matching TE's NVTE_USE_FAST_MATH=1."""
 
+        recipe: Literal["v1", "v1_requant"] = "v1"
+        """NVFP4 recipe for the converted Linears.
+
+        "v1" is the shipped recipe and the default, so an unchanged config produces
+        exactly what it produced before. "v1_requant" moves the weight from 16x16 2D
+        scaling to 1x16 rowwise plus a lazy backward requantization, which puts the
+        forward and dgrad GEMMs on one and the same W_qdq.
+
+        "v2" is deliberately absent. It needs a 128-element ``_rht_sign_vector`` and a
+        second ``_dgrad_rht_sign_vector`` materialized in ``_init_self_buffers``, plus
+        resample wiring; none of that exists for linears yet, and accepting the string
+        here would produce a silently wrong run rather than an error. The MoE path
+        does support it -- see ``NVFP4GroupedExpertsConverter``.
+        """
+
     def __init__(self, config: Config):
         self.config = config
 
@@ -414,6 +469,7 @@ class NVFP4LinearConverter(QuantizationConverter):
                     param_init=config.param_init,
                     kernel_preference=self.config.kernel_preference,
                     use_fast_math=self.config.use_fast_math,
+                    recipe=self.config.recipe,
                 )
                 if parent is None:
                     model_config = new_config
@@ -432,6 +488,9 @@ class NVFP4LinearConverter(QuantizationConverter):
 # w3 up) on "v1_requant" and FC2 (w2 down) on "v2"; that split is a configuration
 # choice, not a hard-coded assumption, and the recipes may be swapped.
 _NVFP4_RECIPES = ("v1", "v1_requant", "v2")
+
+# Linears support a subset: V2 needs buffers _init_self_buffers does not create.
+_NVFP4_LINEAR_RECIPES = ("v1", "v1_requant")
 
 # V2 rotates by RHT-128 rather than RHT-16.
 _V2_RHT_SIZE = 128
