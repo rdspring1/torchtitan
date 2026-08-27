@@ -753,3 +753,227 @@ def test_nvfp4_grouped_converter_passes_recipes_through(monkeypatch):
     converter.convert(routed)
     assert routed.inner_experts.fc1_recipe == "v1_requant"
     assert routed.inner_experts.fc2_recipe == "v2"
+
+
+def test_nvfp4_linear_v2_materializes_both_sign_vectors():
+    """V2 needs an RHT-128 wgrad vector and a second one for dgrad.
+
+    V1/V1_REQUANT carry one static 16-element vector, so the buffer set is the
+    thing that distinguishes a V2 Linear -- and it is what torchao's cadence
+    manager matches on. Neither is checkpointed: both are pure functions of
+    (seed, step, microbatch, fqn), so a checkpoint would pin a stale draw.
+    """
+    NVFP4Linear = _nvfp4_linear_cls()
+    module = NVFP4Linear.Config(
+        in_features=512, out_features=512, recipe="v2", kernel_preference="triton"
+    ).build()
+    module._init_self_buffers(buffer_device=torch.device("cpu"))
+
+    assert module._rht_sign_vector.numel() == 128
+    assert module._dgrad_rht_sign_vector.numel() == 128
+    assert not torch.equal(module._rht_sign_vector, module._dgrad_rht_sign_vector)
+    for buffer in (module._rht_sign_vector, module._dgrad_rht_sign_vector):
+        assert set(buffer.tolist()) <= {-1, 1}
+
+    persistent = dict(module.named_buffers())
+    state = module.state_dict()
+    for name in ("_sr_seed", "_rht_sign_vector", "_dgrad_rht_sign_vector"):
+        assert name in persistent
+        assert name not in state
+
+    # A resampled vector has no stable tuple form, so the V1 accessor must not
+    # quietly hand one out.
+    assert module._rht_sign_vector_tuple is None
+
+
+def test_nvfp4_linear_v1_recipes_have_no_dgrad_vector():
+    """The static recipes rotate only the wgrad axis, so a dgrad vector would be
+    dead state -- and a 128-element one would be picked up by the cadence manager."""
+    NVFP4Linear = _nvfp4_linear_cls()
+    for recipe in ("v1", "v1_requant"):
+        module = NVFP4Linear.Config(
+            in_features=512,
+            out_features=512,
+            recipe=recipe,
+            kernel_preference="triton",
+        ).build()
+        module._init_self_buffers(buffer_device=torch.device("cpu"))
+        assert module._rht_sign_vector.numel() == 16
+        assert getattr(module, "_dgrad_rht_sign_vector", None) is None
+
+
+def test_nvfp4_linear_v2_rejects_cutedsl():
+    """V2 is Triton-only. Downgrading silently would leave a run slower than asked
+    for, on a different SR stream, with nothing in the log to say so."""
+    NVFP4Linear = _nvfp4_linear_cls()
+    with pytest.raises(ValueError, match="only available for recipe 'v1'"):
+        NVFP4Linear.Config(
+            in_features=512,
+            out_features=512,
+            recipe="v2",
+            kernel_preference="cutedsl",
+        ).build()
+
+
+def test_nvfp4_linear_v2_signs_resample_in_place():
+    """The Linear's buffers must satisfy the same cadence contract as the experts'."""
+    NVFP4Linear = _nvfp4_linear_cls()
+    from torchao.prototype.moe_training.nvfp4_training.nvfp4_rht_cadence import (
+        resample_nvfp4_rht_signs,
+    )
+
+    module = NVFP4Linear.Config(
+        in_features=512, out_features=512, recipe="v2", kernel_preference="triton"
+    ).build()
+    module._init_self_buffers(buffer_device=torch.device("cpu"))
+    wgrad, dgrad = module._rht_sign_vector, module._dgrad_rht_sign_vector
+    pointers = (wgrad.data_ptr(), dgrad.data_ptr())
+
+    assert resample_nvfp4_rht_signs(module, seed=3, step=0, microbatch=0) == 2
+
+    first_w, first_d = wgrad.clone(), dgrad.clone()
+    resample_nvfp4_rht_signs(module, seed=3, step=0, microbatch=1)
+    assert not torch.equal(first_w, wgrad), "wgrad resamples per microbatch"
+    assert torch.equal(first_d, dgrad), "dgrad holds across a step's microbatches"
+
+    resample_nvfp4_rht_signs(module, seed=3, step=1, microbatch=0)
+    assert not torch.equal(first_d, dgrad), "dgrad resamples per optimizer step"
+
+    # In place, so a CUDA graph captured around the step survives a resample.
+    assert (wgrad.data_ptr(), dgrad.data_ptr()) == pointers
+
+
+def _build_nvfp4_linear(recipe):
+    NVFP4Linear = _nvfp4_linear_cls()
+    module = NVFP4Linear.Config(
+        in_features=512, out_features=512, recipe=recipe, kernel_preference="triton"
+    ).build()
+    module._init_self_buffers(buffer_device=torch.device("cpu"))
+    return module
+
+
+def test_build_nvfp4_sign_resampler_is_none_without_v2():
+    """Non-V2 runs must not pay for the cadence, and must not be told they are V2."""
+    from torchtitan.components.quantization import build_nvfp4_sign_resampler
+
+    assert build_nvfp4_sign_resampler([], seed=0) is None
+    assert build_nvfp4_sign_resampler([_build_nvfp4_linear("v1_requant")], seed=0) is None
+
+
+def test_build_nvfp4_sign_resampler_drives_every_part():
+    """The trainer holds a list of model parts under PP; all of them must advance."""
+    from torchtitan.components.quantization import build_nvfp4_sign_resampler
+
+    parts = [_build_nvfp4_linear("v2"), _build_nvfp4_linear("v2")]
+    resample = build_nvfp4_sign_resampler(parts, seed=7)
+    assert resample is not None
+
+    before = [p._rht_sign_vector.clone() for p in parts]
+    resample(0, 0)
+    resample(0, 1)
+    for part, was in zip(parts, before):
+        assert not torch.equal(was, part._rht_sign_vector)
+
+    # Same seed and cadence, so a fixed run seed replays the sign schedule.
+    replay = [_build_nvfp4_linear("v2"), _build_nvfp4_linear("v2")]
+    other = build_nvfp4_sign_resampler(replay, seed=7)
+    other(0, 0)
+    other(0, 1)
+    for part, twin in zip(parts, replay):
+        assert torch.equal(part._rht_sign_vector, twin._rht_sign_vector)
+
+
+def test_nvfp4_ffn_fqns_split_fc1_from_fc2():
+    """The split arm rests on the two fqn lists being disjoint.
+
+    The converter matches by substring and rewrites whatever it matches, so an
+    overlap would silently give both halves the last converter's recipe.
+    """
+    registry = pytest.importorskip("torchtitan.models.deepseek_v3.config_registry")
+    _NVFP4_FC1_LEAVES = registry._NVFP4_FC1_LEAVES
+    _NVFP4_FC2_LEAVES = registry._NVFP4_FC2_LEAVES
+    _NVFP4_FFN_SUBMODULES = registry._NVFP4_FFN_SUBMODULES
+    _nvfp4_ffn_linear_fqns = registry._nvfp4_ffn_linear_fqns
+
+    layers = ["layers.0.", "layers.1."]
+    fc1 = _nvfp4_ffn_linear_fqns(layers, _NVFP4_FFN_SUBMODULES, _NVFP4_FC1_LEAVES)
+    fc2 = _nvfp4_ffn_linear_fqns(layers, _NVFP4_FFN_SUBMODULES, _NVFP4_FC2_LEAVES)
+    assert not set(fc1) & set(fc2)
+
+    for layer in layers:
+        for submodule in _NVFP4_FFN_SUBMODULES:
+            for leaf in ("w1", "w2", "w3"):
+                fqn = f"{layer}{submodule}{leaf}"
+                in_fc1 = any(pattern in fqn for pattern in fc1)
+                in_fc2 = any(pattern in fqn for pattern in fc2)
+                assert in_fc1 ^ in_fc2, f"{fqn} matched fc1={in_fc1} fc2={in_fc2}"
+
+    # Omitting leaves keeps the unsplit behaviour byte for byte.
+    assert _nvfp4_ffn_linear_fqns(layers, _NVFP4_FFN_SUBMODULES) == [
+        f"{layer}{submodule}"
+        for layer in layers
+        for submodule in _NVFP4_FFN_SUBMODULES
+    ]
+
+
+@pytest.mark.parametrize(
+    "flavor, fc1_recipe, fc2_recipe",
+    [
+        ("deepseek_v3_16b_nvfp4", "v1", "v1"),
+        ("deepseek_v3_16b_nvfp4_v1_requant", "v1_requant", "v1_requant"),
+        ("deepseek_v3_16b_nvfp4_v2", "v2", "v2"),
+        ("deepseek_v3_16b_nvfp4_split", "v1_requant", "v2"),
+        ("deepseek_v3_671b_nvfp4_v2", "v2", "v2"),
+        ("deepseek_v3_671b_nvfp4_split", "v1_requant", "v2"),
+    ],
+)
+def test_deepseek_v3_v2_flavors_route_fc1_and_fc2(
+    monkeypatch, flavor, fc1_recipe, fc2_recipe
+):
+    """The recipe must reach the modules, not merely the converter config.
+
+    A recipe that stops at the MoE experts leaves the dense FFN and shared experts
+    on v1 and the run silently measures a mixture. Asserted on the transformed
+    config tree, per module, because that is what the converters actually produce.
+    """
+    pytest.importorskip("torchao")
+    # Resolving a config name imports the dataloader stack; nothing on the
+    # converter path under test touches it.
+    pytest.importorskip("datasets")
+    from torchtitan.components.quantization import NVFP4Linear
+    from torchtitan.components.quantization.nvfp4 import _get_nvfp4_grouped_experts_cls
+
+    if NVFP4Linear is None:
+        pytest.skip("torchao NVFP4 training prototype not available")
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    _bypass_nvfp4_hardware_gates(monkeypatch, nvfp4_mod)
+
+    config_manager = ConfigManager()
+    config = config_manager.parse_args(
+        ["--module", "deepseek_v3", "--config", flavor]
+    )
+    model_config = config.model_spec.model
+
+    # FC1 is w1 (gate) and w3 (up); FC2 is w2 (down). Under the split these come
+    # from two converters over disjoint fqns, so a leaked overlap shows up as the
+    # wrong recipe on one of them.
+    by_leaf: dict[str, set] = {}
+    for fqn, cfg, _parent, _attr in model_config.traverse(Linear.Config):
+        if isinstance(cfg, NVFP4Linear.Config):
+            by_leaf.setdefault(fqn.rsplit(".", 1)[-1], set()).add(cfg.recipe)
+    assert by_leaf, f"{flavor} converted no Linear"
+    for leaf in ("w1", "w3"):
+        assert by_leaf.get(leaf) == {fc1_recipe}, (leaf, by_leaf)
+    assert by_leaf.get("w2") == {fc2_recipe}, ("w2", by_leaf)
+
+    NVFP4Experts = _get_nvfp4_grouped_experts_cls(GroupedExperts)
+    experts = [
+        cfg
+        for _fqn, cfg, _parent, _attr in model_config.traverse(GroupedExperts.Config)
+        if isinstance(cfg, NVFP4Experts.Config)
+    ]
+    assert experts, f"{flavor} converted no GroupedExperts"
+    assert all(
+        (cfg.fc1_recipe, cfg.fc2_recipe) == (fc1_recipe, fc2_recipe) for cfg in experts
+    )

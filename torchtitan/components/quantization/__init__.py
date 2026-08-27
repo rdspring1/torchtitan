@@ -43,12 +43,14 @@ from .mx import (  # noqa: F401, E402
     MXFP8LinearConverter,
 )
 from .nvfp4 import (  # noqa: F401, E402
+    build_nvfp4_sign_resampler,
     NVFP4GroupedExpertsConverter,
     NVFP4Linear,
     NVFP4LinearConverter,
 )
 
 __all__ = [
+    "build_nvfp4_sign_resampler",
     "Float8GroupedExpertsConverter",
     "Float8Linear",
     "Float8LinearConverter",

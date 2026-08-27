@@ -40,15 +40,72 @@ _NVFP4_FFN_SUBMODULES = ("feed_forward.", "moe.shared_experts.")
 _NVFP4_FFN_SUBMODULES_NO_DENSE = ("moe.shared_experts.",)
 
 
+# The dense FFN's two halves, named the way the MoE converter names them: w1 is
+# the gate and w3 the up projection (both dim -> hidden), w2 the down projection.
+_NVFP4_FC1_LEAVES = ("w1", "w3")
+_NVFP4_FC2_LEAVES = ("w2",)
+
+
 def _nvfp4_ffn_linear_fqns(
-    layer_fqns: list[str], submodules: tuple[str, ...]
+    layer_fqns: list[str],
+    submodules: tuple[str, ...],
+    leaves: tuple[str, ...] = (),
 ) -> list[str]:
     """Cross-product leading-layer prefixes with FFN submodule paths.
 
     ``layer_fqns`` comes from ``nvfp4_bf16_tail_fqns``, so the bf16 tail is
     single-sourced with the grouped-experts converter's fqns.
+
+    ``leaves`` narrows each submodule to named Linears, which is what lets two
+    converters put FC1 and FC2 on different recipes. The converter matches by
+    substring and the last converter to touch a config wins, so the two fqn lists
+    must be disjoint -- ``_NVFP4_FC1_LEAVES`` and ``_NVFP4_FC2_LEAVES`` are.
     """
-    return [f"{layer}{submodule}" for layer in layer_fqns for submodule in submodules]
+    prefixes = [
+        f"{layer}{submodule}" for layer in layer_fqns for submodule in submodules
+    ]
+    if not leaves:
+        return prefixes
+    return [f"{prefix}{leaf}" for prefix in prefixes for leaf in leaves]
+
+
+def _nvfp4_linear_converters(
+    *,
+    model_compile_enabled: bool,
+    layer_fqns: list[str],
+    submodules: tuple[str, ...],
+    fc1_recipe: str,
+    fc2_recipe: str,
+    backend: dict,
+) -> list[NVFP4LinearConverter.Config]:
+    """The dense-FFN converter arm: one converter, or two when the halves differ.
+
+    ``NVFP4LinearConverter`` carries a single recipe, so splitting FC1 from FC2 on
+    the dense FeedForward and the MoE shared experts takes two converters over
+    disjoint fqns. Keeping the single-converter shape when both halves agree means
+    the common configuration is untouched by the split's existence.
+    """
+    if fc1_recipe == fc2_recipe:
+        return [
+            NVFP4LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=_nvfp4_ffn_linear_fqns(layer_fqns, submodules),
+                recipe=fc1_recipe,
+                **backend,
+            )
+        ]
+    return [
+        NVFP4LinearConverter.Config(
+            model_compile_enabled=model_compile_enabled,
+            fqns=_nvfp4_ffn_linear_fqns(layer_fqns, submodules, leaves),
+            recipe=leaf_recipe,
+            **backend,
+        )
+        for leaves, leaf_recipe in (
+            (_NVFP4_FC1_LEAVES, fc1_recipe),
+            (_NVFP4_FC2_LEAVES, fc2_recipe),
+        )
+    ]
 
 
 def enable_fused_swiglu(config: Trainer.Config) -> None:
@@ -124,7 +181,9 @@ def deepseek_v3_debugmodel_mxfp8() -> Trainer.Config:
     return config
 
 
-def deepseek_v3_debugmodel_nvfp4() -> Trainer.Config:
+def deepseek_v3_debugmodel_nvfp4(
+    recipe: str = "v1", fc2_recipe: str | None = None
+) -> Trainer.Config:
     config = deepseek_v3_debugmodel()
     assert config.model_spec is not None
     model_compile_enabled = (
@@ -140,21 +199,47 @@ def deepseek_v3_debugmodel_nvfp4() -> Trainer.Config:
     n_layers = len(config.model_spec.model.layers)
     _NVFP4_BF16_TAIL_FRACTION = 0.15
     fqns = nvfp4_bf16_tail_fqns(n_layers, _NVFP4_BF16_TAIL_FRACTION)
+    # recipe names FC1 (w1 gate, w3 up); fc2_recipe names FC2 (w2 down) and
+    # defaults to the same, so an unsplit config is unchanged by the split option.
+    fc1_recipe = recipe
+    fc2_recipe = recipe if fc2_recipe is None else fc2_recipe
+    backend = (
+        {}
+        if fc1_recipe == fc2_recipe == "v1"
+        else {"kernel_preference": "triton"}
+    )
     config.model_spec = model_registry(
         "debugmodel",
         converters=[
-            NVFP4LinearConverter.Config(
+            *_nvfp4_linear_converters(
                 model_compile_enabled=model_compile_enabled,
-                fqns=_nvfp4_ffn_linear_fqns(fqns, _NVFP4_FFN_SUBMODULES),
+                layer_fqns=fqns,
+                submodules=_NVFP4_FFN_SUBMODULES,
+                fc1_recipe=fc1_recipe,
+                fc2_recipe=fc2_recipe,
+                backend=backend,
             ),
             NVFP4GroupedExpertsConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=fqns,
                 pad_multiple=128,
+                fc1_recipe=fc1_recipe,
+                fc2_recipe=fc2_recipe,
+                **backend,
             ),
         ],
     )
     return config
+
+
+# Debug-scale arms for the two V2 recipes. These run on a single node with the
+# all-to-all dispatcher, so they are the fast smoke for V2 -- the 16B and 671B
+# arms need 8-way EP and the DeepEP backend.
+deepseek_v3_debugmodel_nvfp4_v2 = partial(deepseek_v3_debugmodel_nvfp4, recipe="v2")
+
+deepseek_v3_debugmodel_nvfp4_split = partial(
+    deepseek_v3_debugmodel_nvfp4, recipe="v1_requant", fc2_recipe="v2"
+)
 
 
 def deepseek_v3_debugmodel_hybridep() -> Trainer.Config:
@@ -232,7 +317,9 @@ def deepseek_v3_16b_hybridep() -> Trainer.Config:
 
 
 def deepseek_v3_16b_nvfp4(
-    bf16_tail_fraction: float = 0.0, recipe: str = "v1"
+    bf16_tail_fraction: float = 0.0,
+    recipe: str = "v1",
+    fc2_recipe: str | None = None,
 ) -> Trainer.Config:
     config = deepseek_v3_16b()
     assert config.model_spec is not None
@@ -277,7 +364,15 @@ def deepseek_v3_16b_nvfp4(
     # Deliberately left UNSET for "v1": deepseek_v3_16b_nvfp4_triton flips the
     # backend by patching the Config class default, and an explicit kwarg at the
     # call site would win over that patch.
-    backend = {} if recipe == "v1" else {"kernel_preference": "triton"}
+    # recipe names FC1 (w1 gate, w3 up); fc2_recipe names FC2 (w2 down) and
+    # defaults to the same, so an unsplit config is unchanged by the split option.
+    fc1_recipe = recipe
+    fc2_recipe = recipe if fc2_recipe is None else fc2_recipe
+    backend = (
+        {}
+        if fc1_recipe == fc2_recipe == "v1"
+        else {"kernel_preference": "triton"}
+    )
     config.model_spec = model_registry(
         "16B",
         attn_backend="flex",
@@ -290,18 +385,20 @@ def deepseek_v3_16b_nvfp4(
         moe_comm_backend="hybridep",
         non_blocking_capacity_factor=0.1875,
         converters=[
-            NVFP4LinearConverter.Config(
+            *_nvfp4_linear_converters(
                 model_compile_enabled=model_compile_enabled,
-                fqns=_nvfp4_ffn_linear_fqns(fqns, _NVFP4_FFN_SUBMODULES_NO_DENSE),
-                recipe=recipe,
-                **backend,
+                layer_fqns=fqns,
+                submodules=_NVFP4_FFN_SUBMODULES_NO_DENSE,
+                fc1_recipe=fc1_recipe,
+                fc2_recipe=fc2_recipe,
+                backend=backend,
             ),
             NVFP4GroupedExpertsConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=fqns,
                 pad_multiple=128,
-                fc1_recipe=recipe,
-                fc2_recipe=recipe,
+                fc1_recipe=fc1_recipe,
+                fc2_recipe=fc2_recipe,
                 **backend,
             ),
             # Attention in MXFP8, matching deepseek_v3_671b_nvfp4_mixed. This arm
@@ -337,6 +434,24 @@ deepseek_v3_16b_nvfp4_f0l5 = partial(deepseek_v3_16b_nvfp4, bf16_tail_fraction=0
 # scaling, so its loss must DIFFER from the V1 arm -- an identical curve means
 # the recipe never reached the converters.
 deepseek_v3_16b_nvfp4_v1_requant = partial(deepseek_v3_16b_nvfp4, recipe="v1_requant")
+
+# V2 on every NVFP4-eligible Linear and on both MoE FFN layers. "Every eligible"
+# is narrower than it sounds and is a property of DSV3's dimensions, not of V2:
+# attention stays MXFP8, wkv_a (2048 -> 576) can never be NVFP4, and layer 0's
+# dense FeedForward (2048 -> 10944, 10944 % 128 == 64) stays bf16. So this is V2
+# on the shared experts plus the routed experts' FC1 and FC2.
+#
+# Its loss must DIFFER from both the v1 and v1_requant arms; an identical curve
+# means the recipe never reached the converters.
+deepseek_v3_16b_nvfp4_v2 = partial(deepseek_v3_16b_nvfp4, recipe="v2")
+
+# Design doc S17: FC1 (w1 gate, w3 up) on V1-Requantization, FC2 (w2 down) on V2,
+# applied to the routed experts and to the dense FFN linears alike. The split is a
+# configuration choice, not a hard-coded assumption -- passing recipe="v2",
+# fc2_recipe="v1_requant" swaps the two arms.
+deepseek_v3_16b_nvfp4_split = partial(
+    deepseek_v3_16b_nvfp4, recipe="v1_requant", fc2_recipe="v2"
+)
 
 
 def deepseek_v3_16b_minimal_async_ep() -> Trainer.Config:
@@ -426,7 +541,9 @@ def deepseek_v3_671b_12_layers_nvfp4_mixed() -> Trainer.Config:
     return config
 
 
-def deepseek_v3_671b_nvfp4_mixed(recipe: str = "v1") -> Trainer.Config:
+def deepseek_v3_671b_nvfp4_mixed(
+    recipe: str = "v1", fc2_recipe: str | None = None
+) -> Trainer.Config:
     config = deepseek_v3_671b()
     assert config.model_spec is not None
     config.compile = CompileConfig(enable=True, components=["model", "loss"])
@@ -454,7 +571,15 @@ def deepseek_v3_671b_nvfp4_mixed(recipe: str = "v1") -> Trainer.Config:
     # Deliberately left UNSET for "v1", matching deepseek_v3_16b_nvfp4: an explicit
     # kwarg here would win over the Config-default patching that
     # deepseek_v3_16b_nvfp4_triton relies on, and the two functions stay symmetric.
-    backend = {} if recipe == "v1" else {"kernel_preference": "triton"}
+    # recipe names FC1 (w1 gate, w3 up); fc2_recipe names FC2 (w2 down) and
+    # defaults to the same, so an unsplit config is unchanged by the split option.
+    fc1_recipe = recipe
+    fc2_recipe = recipe if fc2_recipe is None else fc2_recipe
+    backend = (
+        {}
+        if fc1_recipe == fc2_recipe == "v1"
+        else {"kernel_preference": "triton"}
+    )
     config.model_spec = model_registry(
         "671B",
         attn_backend="flex",
@@ -477,18 +602,20 @@ def deepseek_v3_671b_nvfp4_mixed(recipe: str = "v1") -> Trainer.Config:
         # wastes nothing, not because raising it is unsafe.
         non_blocking_capacity_factor=0.03125,
         converters=[
-            NVFP4LinearConverter.Config(
+            *_nvfp4_linear_converters(
                 model_compile_enabled=model_compile_enabled,
-                fqns=_nvfp4_ffn_linear_fqns(fqns, _NVFP4_FFN_SUBMODULES),
-                recipe=recipe,
-                **backend,
+                layer_fqns=fqns,
+                submodules=_NVFP4_FFN_SUBMODULES,
+                fc1_recipe=fc1_recipe,
+                fc2_recipe=fc2_recipe,
+                backend=backend,
             ),
             NVFP4GroupedExpertsConverter.Config(
                 model_compile_enabled=model_compile_enabled,
                 fqns=fqns,
                 pad_multiple=128,
-                fc1_recipe=recipe,
-                fc2_recipe=recipe,
+                fc1_recipe=fc1_recipe,
+                fc2_recipe=fc2_recipe,
                 **backend,
             ),
             # Attention in MXFP8, not NVFP4. The shapes would permit NVFP4 --
@@ -521,6 +648,15 @@ def deepseek_v3_671b_nvfp4_mixed(recipe: str = "v1") -> Trainer.Config:
 # getattr + callable (config/manager.py:144), which a partial satisfies.
 deepseek_v3_671b_nvfp4_v1_requant = partial(
     deepseek_v3_671b_nvfp4_mixed, recipe="v1_requant"
+)
+
+# The 671B counterparts of deepseek_v3_16b_nvfp4_v2 / _split. At 671B the dense
+# FeedForward is 7168 -> 18432 and does convert, so the split reaches it as well
+# as the shared experts.
+deepseek_v3_671b_nvfp4_v2 = partial(deepseek_v3_671b_nvfp4_mixed, recipe="v2")
+
+deepseek_v3_671b_nvfp4_split = partial(
+    deepseek_v3_671b_nvfp4_mixed, recipe="v1_requant", fc2_recipe="v2"
 )
 
 

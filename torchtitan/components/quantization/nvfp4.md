@@ -122,6 +122,62 @@ The Llama results and instructions use the container's current upstream builds:
 - PyTorch: `2.14.0a0+gitd9abf9e`
 - TorchAO: `0.18.0+gitcb76f29`
 
+### The V2 Recipe
+
+Three NVFP4 recipes are selectable per converter. `v1` is the shipped default.
+`v1_requant` replaces V1's 16x16 2D weight quantize with a 1x16 rowwise quantize
+plus a lazy backward requantization, so the forward and dgrad GEMMs consume one
+and the same dequantized weight. `v2` additionally rotates by RHT-128 instead of
+RHT-16, rounds the gradient with MS-EDEN rather than stochastic rounding, and
+rotates the dgrad axis as well as the wgrad axis.
+
+`v2` is the only recipe with **dynamic** sign vectors. It carries two 128-element
+`{-1,+1}` buffers per module, and the training loop must advance them: wgrad every
+microbatch, dgrad every optimizer step. `Trainer` does this through
+`build_nvfp4_sign_resampler`, which reports the buffer count at startup:
+
+```
+NVFP4 V2: resampling 54 RHT sign buffers per microbatch
+```
+
+A run that never resamples is still numerically correct -- it simply reuses the
+initial draw for every step and forfeits the variance reduction V2 exists for. It
+would train and log a plausible loss while measuring something other than V2, so
+check for that line before trusting a V2 convergence number.
+
+Each vector is derived from `(seed, step, microbatch, module FQN, buffer name)`
+via BLAKE2b, so ranks agree with no collective and a fixed `--debug.seed` replays
+the whole sign schedule. The buffers are updated in place and never checkpointed.
+
+#### DSV3 configurations
+
+| Config | FC1 (`w1` gate, `w3` up) | FC2 (`w2` down) |
+| --- | --- | --- |
+| `deepseek_v3_{16b,671b}_nvfp4{,_mixed}` | v1 | v1 |
+| `deepseek_v3_{16b,671b}_nvfp4_v1_requant` | v1_requant | v1_requant |
+| `deepseek_v3_{16b,671b}_nvfp4_v2` | v2 | v2 |
+| `deepseek_v3_{16b,671b}_nvfp4_split` | v1_requant | v2 |
+
+`_split` is design doc §17's routing. It applies to the routed experts and to the
+dense FFN linears alike; the dense half takes two `NVFP4LinearConverter` instances
+over disjoint fqns, since one converter carries one recipe.
+
+Note that "V2 everywhere" is bounded by what NVFP4 can quantize at all, which is a
+property of DSV3's dimensions rather than of the recipe. Attention stays MXFP8,
+`wkv_a` (dim -> 576) is never eligible, and at 16B the dense FeedForward
+(2048 -> 10944, and 10944 % 128 == 64) stays bf16.
+
+#### V2 limitations
+
+- Triton only. The CuteDSL kernels exist for `v1` alone, and requesting
+  `kernel_preference="cutedsl"` with `v1_requant` or `v2` raises rather than
+  downgrading the backend.
+- Plain `torch.compile` works. CUDA graphs (`mode="reduce-overhead"`) do not: the
+  grouped path allocates its offsets tensor inside the traced region.
+- Under pipeline parallelism the schedule drives its own microbatches internally,
+  so the resample advances once per gradient-accumulation group rather than once
+  per PP microbatch. That is a coarser wgrad cadence, not a correctness problem.
+
 ### Known Limitations
 
 - NVFP4 is a TorchAO prototype and is experimental.

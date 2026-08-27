@@ -84,7 +84,9 @@ try:
     )
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_linear_v2 import (
         _NVFP4LinearV1Requant,
+        _NVFP4LinearV2,
         nvfp4_linear_v1_requant,
+        nvfp4_linear_v2,
     )
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_recipe import NVFP4Recipe
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_training import (
@@ -161,6 +163,8 @@ try:
     # local_map region, so it needs the same declaration or SPMD type checking stops
     # at it.
     spmd.register_local_autograd_function(_NVFP4LinearV1Requant)
+    # V2's forward is a third such Function, reached from the same region.
+    spmd.register_local_autograd_function(_NVFP4LinearV2)
 
     class NVFP4Linear(TorchAONVFP4Linear, Module):
         """NVFP4 Linear satisfying torchtitan's Module protocol.
@@ -183,12 +187,19 @@ try:
             """Approximate-reciprocal RHT quantize, matching TE's NVTE_USE_FAST_MATH=1."""
 
             recipe: str = "v1"
-            """NVFP4 recipe: "v1" or "v1_requant". See _NVFP4_LINEAR_RECIPES."""
+            """NVFP4 recipe: one of _NVFP4_RECIPES.
+
+            "v2" draws a 128-element ``_rht_sign_vector`` and a second
+            ``_dgrad_rht_sign_vector``, and expects the training loop to advance
+            them through ``build_nvfp4_sign_resampler``. Without that the run is
+            still correct, but every step reuses the initial draw and the variance
+            reduction V2 exists for is forfeited.
+            """
 
             def __post_init__(self) -> None:
-                if self.recipe not in _NVFP4_LINEAR_RECIPES:
+                if self.recipe not in _NVFP4_RECIPES:
                     raise ValueError(
-                        f"recipe must be one of {_NVFP4_LINEAR_RECIPES}, "
+                        f"recipe must be one of {_NVFP4_RECIPES}, "
                         f"got {self.recipe!r}"
                     )
                 # NVFP4 needs every GEMM dim to be a multiple of 128 on either
@@ -265,8 +276,9 @@ try:
                 use_fast_math=config.use_fast_math,
                 recipe=NVFP4Recipe(config.recipe),
             )
-            # V1_REQUANT is Triton-only; the CuteDSL kernels exist for V1 alone.
-            # Raise rather than silently downgrade, matching the grouped converter.
+            # V1_REQUANT and V2 are Triton-only; the CuteDSL kernels exist for V1
+            # alone. Raise rather than silently downgrade, matching the grouped
+            # converter.
             if (
                 config.recipe != "v1"
                 and self.kernel_preference is KernelPreference.CUTEDSL
@@ -291,8 +303,14 @@ try:
             # _rht_sign_vector is the fixed _HARDCODED_SIGN_VECTOR (see module
             # top): identical on every rank, so it is non-persistent (a
             # deterministic constant needs no checkpointing) and re-materialized
-            # per rank in _init_self_buffers with no cross-rank broadcast.
+            # per rank in _init_self_buffers with no cross-rank broadcast. Under
+            # V2 it holds a 128-element resampled vector instead, but the
+            # None-then-materialize protocol is the same.
             self.register_buffer("_rht_sign_vector", None, persistent=False)
+            # V2 rotates the dgrad axis too, so TorchAO gave it a second vector.
+            # Same treatment: derived per rank, never checkpointed.
+            if self.recipe is NVFP4Recipe.V2:
+                self.register_buffer("_dgrad_rht_sign_vector", None, persistent=False)
             self._rht_sign_vector_tuple = None
 
         def _local_rht_sign_vector(self) -> torch.Tensor:
@@ -302,6 +320,11 @@ try:
             return sign_vector
 
         def _refresh_rht_sign_vector_tuple(self) -> None:
+            # V2 resamples its vector, so there is no stable tuple to cache and
+            # nothing on its forward path wants one -- it passes the buffer itself.
+            if self.recipe is NVFP4Recipe.V2:
+                self._rht_sign_vector_tuple = None
+                return
             sign_vector = self._local_rht_sign_vector()
             self._rht_sign_vector_tuple = (
                 None if sign_vector is None else _rht_sign_vector_to_tuple(sign_vector)
@@ -336,17 +359,41 @@ try:
                 dtype=torch.int64,
                 device=dev,
             )
-            # Static RHT basis: identical on every rank by construction, so it is
-            # a plain local tensor with no cross-rank broadcast.
-            self._rht_sign_vector = _make_rht_sign_vector(
-                _HARDCODED_SIGN_VECTOR, device=dev
-            )
+            if self.recipe is NVFP4Recipe.V2:
+                # Fixed shape and updated in place by torchao's
+                # resample_nvfp4_rht_signs, so the addresses survive CUDA-graph
+                # capture. Derived from a constant seed rather than broadcast, for
+                # the same reason as the static basis below. These are only the
+                # pre-resample draw: once the trainer drives the cadence every
+                # vector is keyed by its own FQN.
+                self._rht_sign_vector = _draw_sign_vector(
+                    _V2_RHT_SIZE, _V2_LINEAR_WGRAD_SEED, dev
+                )
+                self._dgrad_rht_sign_vector = _draw_sign_vector(
+                    _V2_RHT_SIZE, _V2_LINEAR_DGRAD_SEED, dev
+                )
+            else:
+                # Static RHT basis: identical on every rank by construction, so it
+                # is a plain local tensor with no cross-rank broadcast.
+                self._rht_sign_vector = _make_rht_sign_vector(
+                    _HARDCODED_SIGN_VECTOR, device=dev
+                )
             self._refresh_rht_sign_vector_tuple()
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
             # Dispatched here rather than deferred to the TorchAO base: the base's
             # forward also carries the process_group TP protocol, which this class
             # does not use -- TP here is spmd local_map sharding instead.
+            if self.recipe is NVFP4Recipe.V2:
+                return nvfp4_linear_v2(
+                    x,
+                    self.weight,
+                    self.bias,
+                    wgrad_rht=self._rht_sign_vector,
+                    dgrad_rht=self._dgrad_rht_sign_vector,
+                    sr_seed=self._sr_seed,
+                    use_fast_math=self.use_fast_math,
+                )
             if self.recipe is not NVFP4Recipe.V1:
                 return nvfp4_linear_v1_requant(
                     x,
@@ -416,7 +463,7 @@ class NVFP4LinearConverter(QuantizationConverter):
         use_fast_math: bool = True
         """Approximate-reciprocal RHT quantize, matching TE's NVTE_USE_FAST_MATH=1."""
 
-        recipe: Literal["v1", "v1_requant"] = "v1"
+        recipe: Literal["v1", "v1_requant", "v2"] = "v1"
         """NVFP4 recipe for the converted Linears.
 
         "v1" is the shipped recipe and the default, so an unchanged config produces
@@ -424,11 +471,12 @@ class NVFP4LinearConverter(QuantizationConverter):
         scaling to 1x16 rowwise plus a lazy backward requantization, which puts the
         forward and dgrad GEMMs on one and the same W_qdq.
 
-        "v2" is deliberately absent. It needs a 128-element ``_rht_sign_vector`` and a
-        second ``_dgrad_rht_sign_vector`` materialized in ``_init_self_buffers``, plus
-        resample wiring; none of that exists for linears yet, and accepting the string
-        here would produce a silently wrong run rather than an error. The MoE path
-        does support it -- see ``NVFP4GroupedExpertsConverter``.
+        "v2" additionally rotates the dgrad axis by RHT-128 and rounds the gradient
+        with MS-EDEN. It carries two 128-element sign vectors that the training loop
+        must advance once per microbatch -- ``Trainer`` does this through
+        ``build_nvfp4_sign_resampler``. A loop that never calls it still trains
+        correctly, but reuses the initial draw forever and measures something other
+        than V2, which is why the resampler logs its buffer count at startup.
         """
 
     def __init__(self, config: Config):
@@ -482,18 +530,24 @@ class NVFP4LinearConverter(QuantizationConverter):
         return model_config
 
 
-# NVFP4 recipes available to the MoE path. "v1" is the shipped recipe and stays
-# the default for both FFN layers, so an unchanged config produces exactly what it
-# produced before the other two existed. Design doc §17 recommends FC1 (w1 gate,
-# w3 up) on "v1_requant" and FC2 (w2 down) on "v2"; that split is a configuration
-# choice, not a hard-coded assumption, and the recipes may be swapped.
+# The NVFP4 recipes, shared by the linear and MoE paths. Linears carried a
+# narrower list until they grew V2's dynamic sign buffers. "v1" is the shipped
+# recipe and stays the default everywhere, so an unchanged config produces exactly
+# what it produced before the other two existed. Design doc §17 recommends FC1
+# (w1 gate, w3 up) on "v1_requant" and FC2 (w2 down) on "v2"; that split is a
+# configuration choice, not a hard-coded assumption, and the recipes may be
+# swapped.
 _NVFP4_RECIPES = ("v1", "v1_requant", "v2")
-
-# Linears support a subset: V2 needs buffers _init_self_buffers does not create.
-_NVFP4_LINEAR_RECIPES = ("v1", "v1_requant")
 
 # V2 rotates by RHT-128 rather than RHT-16.
 _V2_RHT_SIZE = 128
+
+# The pre-resample draw for a V2 Linear's two sign vectors. Distinct from the MoE
+# path's 0xFC2/0xDEAD so a linear and an expert module in the same layer do not
+# open the run on the same basis. Only the first step depends on these: from the
+# first resample onward every buffer is keyed by its own FQN.
+_V2_LINEAR_WGRAD_SEED = 0x1EA1
+_V2_LINEAR_DGRAD_SEED = 0x1EA2
 
 
 def _draw_sign_vector(length: int, seed: int, device) -> torch.Tensor:
@@ -508,6 +562,69 @@ def _draw_sign_vector(length: int, seed: int, device) -> torch.Tensor:
     generator = torch.Generator().manual_seed(seed)
     bits = torch.randint(0, 2, (length,), generator=generator, dtype=torch.int8)
     return (bits * 2 - 1).to(device)
+
+
+def _expects_v2(module) -> bool:
+    """Whether *module* was configured to run the V2 recipe."""
+    recipe = getattr(module, "recipe", None)
+    if recipe is not None and getattr(recipe, "value", recipe) == "v2":
+        return True
+    return "v2" in (
+        getattr(module, "_fc1_recipe", None),
+        getattr(module, "_fc2_recipe", None),
+    )
+
+
+def build_nvfp4_sign_resampler(model_parts, seed: int):
+    """Return a ``(step, microbatch) -> None`` callable, or ``None`` if nothing needs it.
+
+    V2 resamples its RHT sign vectors -- wgrad every microbatch, dgrad every
+    optimizer step -- and TorchAO mutates the buffers in place so their addresses
+    survive CUDA-graph capture. Nothing else drives this: the converter protocol
+    rewrites a config tree and is never called again, so the cadence can only come
+    from the training loop.
+
+    Call this **after** ``init_weights``. The buffers are registered as ``None`` and
+    materialized in ``_init_self_buffers``, and ``iter_dynamic_sign_buffers`` skips a
+    ``None`` buffer -- so probing earlier finds nothing and silently disables the
+    cadence for the whole run.
+
+    Returning ``None`` when there is nothing to resample keeps the per-microbatch
+    cost of a non-V2 run at one identity check, and keeps recipe branching out of the
+    trainer.
+    """
+    try:
+        from torchao.prototype.moe_training.nvfp4_training.nvfp4_rht_cadence import (
+            iter_dynamic_sign_buffers,
+            resample_nvfp4_rht_signs,
+        )
+    except ImportError:
+        return None
+
+    counts = [sum(1 for _ in iter_dynamic_sign_buffers(part)) for part in model_parts]
+    total = sum(counts)
+    if not total:
+        # A V2 module with no dynamic buffer means _init_self_buffers did not run,
+        # or the recipe never reached the modules. The run would train and log a
+        # plausible loss while measuring the initial draw forever, so say so.
+        if any(_expects_v2(m) for part in model_parts for m in part.modules()):
+            logger.warning(
+                "NVFP4: a V2 recipe is configured but no dynamic RHT sign buffers "
+                "were found, so the sign vectors will never be resampled. This run "
+                "does not measure V2."
+            )
+        return None
+
+    parts = [part for part, count in zip(model_parts, counts) if count]
+    logger.info("NVFP4 V2: resampling %d RHT sign buffers per microbatch", total)
+
+    def resample(step: int, microbatch: int) -> None:
+        for part in parts:
+            resample_nvfp4_rht_signs(
+                part, seed=seed, step=step, microbatch=microbatch
+            )
+
+    return resample
 
 
 _nvfp4_experts_cache: dict[type, type] = {}

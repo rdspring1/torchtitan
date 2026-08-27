@@ -26,6 +26,7 @@ from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper, IGNORE_INDE
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.quantization.nvfp4 import build_nvfp4_sign_resampler
 from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
 from torchtitan.components.validate import BaseValidator, Validator
@@ -499,6 +500,18 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             f"({device_mem_stats.max_reserved_pct:.2f}%)"
         )
 
+        # NVFP4 V2 resamples its RHT sign vectors on a cadence the training loop
+        # owns; every other recipe gets None here and pays one identity check per
+        # microbatch. Built after init_weights, which is what materializes the
+        # buffers -- probing before that finds None buffers and silently disables
+        # the cadence. Seeded from the run seed so a fixed seed replays the sign
+        # schedule; ranks agree without a collective because torchao derives each
+        # vector from the buffer's FQN.
+        self._nvfp4_resample = build_nvfp4_sign_resampler(
+            self.model_parts,
+            seed=config.debug.seed if config.debug.seed is not None else 0,
+        )
+
         # build optimizer after applying parallelisms to the model
         self.optimizers = config.optimizer.build(model_parts=self.model_parts)
         if model_spec.post_optimizer_build_fn is not None:
@@ -837,7 +850,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
 
         # Process each gradient accumulation step, then free its inputs.
         accumulated_losses = []
-        for microbatches in microbatch_groups:
+        for mb_idx, microbatches in enumerate(microbatch_groups):
+            # Before the forward and outside any graph capture, per torchao's
+            # cadence contract. Under PP the schedule drives its own microbatches
+            # internally and is not reachable from here, so this advances once per
+            # accumulation group -- a coarser wgrad cadence, which costs variance
+            # reduction rather than correctness.
+            if self._nvfp4_resample is not None:
+                self._nvfp4_resample(self.step, mb_idx)
+
             input_dict_mbs = []
             label_mbs = []
             for input_dict, labels in microbatches:
