@@ -601,6 +601,30 @@ def build_nvfp4_sign_resampler(model_parts, seed: int):
     except ImportError:
         return None
 
+    # Selection is by buffer length and name suffix, with no reference to the
+    # recipe, so a 128-element buffer materialized on a non-V2 module is
+    # indistinguishable from a real one here. That is not hypothetical: the grouped
+    # experts' _fc2 sign vectors used to be drawn on every recipe, and E14's
+    # V1_REQUANT arm resampled 52 buffers nothing reads. Gated at the draw now, so
+    # this should be empty -- it is a guard against the next unconditional buffer,
+    # because a stray one costs work AND makes a nonzero count stop proving the
+    # cadence reached the V2 modules.
+    strays = [
+        f"{fqn}.{name}"
+        for part in model_parts
+        for fqn, name, _, _ in iter_dynamic_sign_buffers(part)
+        if not _expects_v2(part.get_submodule(fqn))
+    ]
+    if strays:
+        logger.warning(
+            "NVFP4: %d dynamic RHT sign buffers sit on modules that do not run V2 "
+            "(e.g. %s). They will be resampled every microbatch and read by nothing, "
+            "and their presence means a nonzero buffer count no longer proves the "
+            "cadence reached the V2 modules.",
+            len(strays),
+            strays[0],
+        )
+
     counts = [sum(1 for _ in iter_dynamic_sign_buffers(part)) for part in model_parts]
     total = sum(counts)
     if not total:
@@ -695,7 +719,8 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
             # quantization path, so they must not share a seed or a sign vector:
             # correlated noise between them defeats the point of drawing either.
             # Registered unconditionally so the buffer set does not depend on the
-            # recipe, which keeps _distribute_states and meta-init uniform.
+            # recipe, which keeps _distribute_states and meta-init uniform. The
+            # two sign vectors are only DRAWN under V2 -- see _init_self_buffers.
             self.register_buffer("_fc2_sr_seed", None, persistent=False)
             self.register_buffer("_fc2_rht_sign_vector", None, persistent=False)
             self.register_buffer("_fc2_dgrad_rht_sign_vector", None, persistent=False)
@@ -752,12 +777,31 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
                 dtype=torch.int64,
                 device=dev,
             )
-            # Fixed shape and updated in place by torchao's
-            # resample_nvfp4_rht_signs, so the addresses survive CUDA-graph capture.
-            self._fc2_rht_sign_vector = _draw_sign_vector(_V2_RHT_SIZE, 0xFC2, dev)
-            self._fc2_dgrad_rht_sign_vector = _draw_sign_vector(
-                _V2_RHT_SIZE, 0xDEAD, dev
-            )
+            # Drawn only when a half actually runs V2: the V2 branch of
+            # _recipe_grouped_mm is the only reader, and the v1 and v1_requant
+            # branches pass the 16-element _HARDCODED_SIGN_VECTOR instead.
+            #
+            # Leaving them None otherwise is load-bearing, not tidiness.
+            # iter_dynamic_sign_buffers selects on numel() == 128 and the name
+            # suffix alone, so a materialized pair is resampled every microbatch on
+            # a run with no V2 module anywhere -- work for buffers nothing reads,
+            # and a "NVFP4 V2: resampling N ..." line on a pure V1 run. It also
+            # destroyed the count's diagnostic value: with an unconditional pair, a
+            # nonzero count no longer proved the cadence had reached the V2
+            # modules. Measured at 52 on the 16B V1_REQUANT arm of E14 (26 MoE
+            # layers x 2); see dsv3/v2/README.md in core-models.
+            #
+            # Numerics were never affected, and gating does not change V2: the
+            # buffers V2 reads are still drawn here, under the same names, so
+            # torchao's FQN-derived resample schedule is untouched.
+            if _expects_v2(self):
+                # Fixed shape and updated in place by torchao's
+                # resample_nvfp4_rht_signs, so the addresses survive CUDA-graph
+                # capture.
+                self._fc2_rht_sign_vector = _draw_sign_vector(_V2_RHT_SIZE, 0xFC2, dev)
+                self._fc2_dgrad_rht_sign_vector = _draw_sign_vector(
+                    _V2_RHT_SIZE, 0xDEAD, dev
+                )
 
         def _grouped_mm(self, *, A, B_t, offs):
             # torchao's NVFP4 grouped MM takes the un-transposed weight B (E, N, K)

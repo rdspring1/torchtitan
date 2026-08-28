@@ -667,8 +667,17 @@ def test_nvfp4_fc1_and_fc2_state_is_independent():
     pytest.importorskip("torchao")
     nvfp4_mod = _nvfp4_experts_or_skip()
     cls = nvfp4_mod._get_nvfp4_grouped_experts_cls(GroupedExperts)
+    # The split itself, which is what the docstring describes. Built on v1/v1
+    # before, which meant it asserted the fc2 sign vectors exist on a recipe whose
+    # grouped MM never reads them -- the behavior that made E14's V1_REQUANT arm
+    # resample 52 buffers for nothing.
     module = cls.Config(
-        dim=128, hidden_dim=256, num_experts=2, kernel_preference="triton"
+        dim=128,
+        hidden_dim=256,
+        num_experts=2,
+        kernel_preference="triton",
+        fc1_recipe="v1_requant",
+        fc2_recipe="v2",
     ).build()
     module._init_self_buffers(buffer_device=torch.device("cpu"))
 
@@ -709,8 +718,14 @@ def test_nvfp4_v2_sign_buffers_resample_in_place():
     )
 
     cls = nvfp4_mod._get_nvfp4_grouped_experts_cls(GroupedExperts)
+    # fc2 on V2, so the buffers under test are the ones the V2 grouped MM reads.
     module = cls.Config(
-        dim=128, hidden_dim=256, num_experts=2, kernel_preference="triton"
+        dim=128,
+        hidden_dim=256,
+        num_experts=2,
+        kernel_preference="triton",
+        fc1_recipe="v1_requant",
+        fc2_recipe="v2",
     ).build()
     module._init_self_buffers(buffer_device=torch.device("cpu"))
 
@@ -852,12 +867,37 @@ def _build_nvfp4_linear(recipe):
     return module
 
 
-def test_build_nvfp4_sign_resampler_is_none_without_v2():
-    """Non-V2 runs must not pay for the cadence, and must not be told they are V2."""
+@pytest.mark.parametrize("fc1,fc2", [("v1", "v1"), ("v1_requant", "v1_requant")])
+def test_build_nvfp4_sign_resampler_is_none_without_v2(fc1, fc2):
+    """Non-V2 runs must not pay for the cadence, and must not be told they are V2.
+
+    The grouped case is the one with teeth. This test only covered NVFP4Linear
+    before, whose non-V2 sign vector is 16 elements and so fails
+    iter_dynamic_sign_buffers' length filter no matter what. The grouped experts
+    drew _fc2_rht_sign_vector and _fc2_dgrad_rht_sign_vector at 128 elements on
+    every recipe, so a pure V1_REQUANT run reported 2 buffers per MoE layer,
+    resampled them every microbatch, and read none of them -- 52 of them on E14's
+    16B arm. Selection is by length and name, so nothing downstream could tell
+    them from real ones.
+    """
+    pytest.importorskip("torchao")
     from torchtitan.components.quantization import build_nvfp4_sign_resampler
 
     assert build_nvfp4_sign_resampler([], seed=0) is None
     assert build_nvfp4_sign_resampler([_build_nvfp4_linear("v1_requant")], seed=0) is None
+
+    nvfp4_mod = _nvfp4_experts_or_skip()
+    cls = nvfp4_mod._get_nvfp4_grouped_experts_cls(GroupedExperts)
+    experts = cls.Config(
+        dim=128,
+        hidden_dim=256,
+        num_experts=2,
+        kernel_preference="triton",
+        fc1_recipe=fc1,
+        fc2_recipe=fc2,
+    ).build()
+    experts._init_self_buffers(buffer_device=torch.device("cpu"))
+    assert build_nvfp4_sign_resampler([experts], seed=0) is None
 
 
 def test_build_nvfp4_sign_resampler_drives_every_part():
