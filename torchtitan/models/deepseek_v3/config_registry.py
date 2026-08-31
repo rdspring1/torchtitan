@@ -450,7 +450,17 @@ def deepseek_v3_671b_nvfp4_mixed() -> Trainer.Config:
         # Fixed by torchtitan 791f2415 + torchao 14555766 and verified at the
         # unchanged failing cf 0.1875, so exact fit is kept here only because it
         # wastes nothing, not because raising it is unsafe.
-        non_blocking_capacity_factor=0.03125,
+        #
+        # RAISED TO 0.0375 FOR THE CONVERGENCE SEED SWEEP -- deliberate, do not
+        # revert to the exact fit without reading this. The exact fit is exact for
+        # *balanced* routing, but moe_force_load_balance is False, so real
+        # per-expert demand exceeds the round-robin figure and this arm drops more
+        # tokens than the bf16 and mxfp8 arms, which both sit at 0.0375 with ~20%
+        # slack. That is a data-path difference, not a precision one: left at
+        # 0.03125 the sweep measures precision *plus* a different token-drop rate
+        # and can attribute the result to neither. Throughput runs should keep the
+        # exact fit -- this value costs a little speed to buy attributability.
+        non_blocking_capacity_factor=0.0375,
         converters=[
             NVFP4LinearConverter.Config(
                 model_compile_enabled=model_compile_enabled,
