@@ -80,6 +80,7 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         dp_rank: int = 0,
         dp_world_size: int = 1,
         infinite: bool = False,
+        shuffle_seed: int | None = None,
     ) -> None:
         # Force lowercase for consistent comparison
         dataset_name = dataset_name.lower()
@@ -90,6 +91,12 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         ds = dataset_loader(path)
 
         self.dataset_name = dataset_name
+        self._shuffle_seed = shuffle_seed
+        # Shuffle before splitting, as ChatDataset does, so the seed changes both
+        # the sample order and which rank sees which shard. shuffle_seed=None
+        # leaves epoch 0 unshuffled, which is the historical behaviour.
+        if shuffle_seed is not None:
+            ds = ds.shuffle(seed=shuffle_seed)
         # Keep an unshuffled reference so map-style datasets can be re-shuffled
         # deterministically on re-loop and on checkpoint resume.
         self._original_data = split_dataset_by_node(ds, dp_rank, dp_world_size)
@@ -177,7 +184,11 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
         self._epoch += 1
         if isinstance(self._data, Dataset):
             self._data = cast(
-                Dataset, self._original_data.shuffle(seed=42 + self._epoch)
+                Dataset,
+                self._original_data.shuffle(
+                    seed=(42 if self._shuffle_seed is None else self._shuffle_seed)
+                    + self._epoch
+                ),
             )
         elif hasattr(self._data, "set_epoch") and hasattr(self._data, "epoch"):
             self._data.set_epoch(self._data.epoch + 1)
@@ -205,7 +216,11 @@ class HuggingFaceTextDataset(IterableDataset, Stateful):
             # preserves bit-identical resume for single-epoch training runs.
             if self._epoch > 0:
                 self._data = cast(
-                    Dataset, self._original_data.shuffle(seed=42 + self._epoch)
+                    Dataset,
+                    self._original_data.shuffle(
+                        seed=(42 if self._shuffle_seed is None else self._shuffle_seed)
+                        + self._epoch
+                    ),
                 )
         else:
             assert "data" in state_dict
@@ -247,6 +262,10 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
         infinite: bool = True
         """Whether to loop the dataset infinitely"""
 
+        shuffle_seed: int | None = None
+        """Seed for the dataset shuffle. None reproduces the historical order
+        exactly: epoch 0 unshuffled, later epochs shuffled with 42 + epoch."""
+
     def __init__(
         self,
         config: Config,
@@ -267,6 +286,7 @@ class HuggingFaceTextDataLoader(ParallelAwareDataloader):
             dp_rank=dp_rank,
             dp_world_size=dp_world_size,
             infinite=config.infinite,
+            shuffle_seed=config.shuffle_seed,
         )
 
         dataloader_kwargs = {
@@ -304,6 +324,10 @@ class InterleavedHuggingFaceTextDataLoader(ParallelAwareDataloader):
 
         seed: int = 42
         """Interleaving seed"""
+
+        shuffle_seed: int | None = None
+        """Seed for the within-dataset shuffle of every source. Distinct from
+        `seed` above, which only controls interleaving between sources."""
 
         stopping_strategy: Literal[
             "on_first_exhausted", "all_exhausted"
@@ -344,6 +368,7 @@ class InterleavedHuggingFaceTextDataLoader(ParallelAwareDataloader):
                     dp_rank=dp_rank,
                     dp_world_size=dp_world_size,
                     infinite=source.infinite,
+                    shuffle_seed=config.shuffle_seed,
                 )
                 for source in config.sources
             ],
