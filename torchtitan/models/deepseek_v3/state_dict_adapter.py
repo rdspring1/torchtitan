@@ -14,6 +14,7 @@ from torch.distributed.tensor import DTensor
 
 from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.models.utils import MoEStateDictAdapter
+from torchtitan.tools.logging import logger
 from .model import DeepSeekV3Model
 
 
@@ -169,7 +170,24 @@ class DeepSeekV3StateDictAdapter(MoEStateDictAdapter):
         state_dict = {}
         expert_weights_by_layer = {}  # {layer: {abstract_key: {expert_id: tensor}}}
 
+        # DeepSeek-V3 checkpoints ship a multi-token-prediction module as one extra
+        # layer past the decoder (model.layers.61.* for the 61-layer 671B).
+        # torchtitan has no MTP, so those keys have no destination and must be
+        # dropped before the dispatch below. Dropping by layer index rather than by
+        # MTP submodule name catches both failure modes at once: `enorm`, `hnorm`,
+        # `eh_proj` and `shared_head.*` are absent from from_hf_map and would raise
+        # KeyError, while the MTP layer's own `mlp.experts.*` are worse -- their
+        # abstract key *is* in from_hf_map, so they would silently be mapped onto a
+        # layer index this model does not have.
+        n_layers = len(self.model_config.layers)
+        skipped_layer_nums = set()
+
         for key, value in hf_state_dict.items():
+            layer_match = re.match(r"model\.layers\.(\d+)\.", key)
+            if layer_match and int(layer_match.group(1)) >= n_layers:
+                skipped_layer_nums.add(int(layer_match.group(1)))
+                continue
+
             if "mlp.experts" in key:
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=2)
                 layer_num, expert_num = re.findall(r"\d+", key)
@@ -219,5 +237,12 @@ class DeepSeekV3StateDictAdapter(MoEStateDictAdapter):
             else:
                 new_key = self.from_hf_map[key]
                 state_dict[new_key] = value
+
+        if skipped_layer_nums:
+            logger.info(
+                f"from_hf: model has {n_layers} layers; skipped all checkpoint keys "
+                f"for layer indices {sorted(skipped_layer_nums)} "
+                f"(no destination in this model)"
+            )
 
         return state_dict
