@@ -26,6 +26,9 @@ from torchtitan.components.loss import BaseLoss, ChunkedLossWrapper, IGNORE_INDE
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import ensure_pp_loss_visible, MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.quantization.nvfp4 import (
+    refresh_nvfp4_grouped_weight_caches,
+)
 from torchtitan.components.quantization.utils import has_quantization
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
 from torchtitan.components.validate import BaseValidator, Validator
@@ -511,6 +514,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         )
         self.metrics_processor.optimizers = self.optimizers
         self.metrics_processor.model_parts = self.model_parts
+        self._cache_nvfp4_grouped_weights = any(
+            getattr(module, "_quantized_weight_cache", None) is not None
+            for model in self.model_parts
+            for module in model.modules()
+        )
 
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.
@@ -872,6 +880,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             )
             self.checkpointer.maybe_wait_for_staging()
             self.optimizers.step()
+            if self._cache_nvfp4_grouped_weights:
+                refresh_nvfp4_grouped_weight_caches(self.model_parts)
             self.lr_schedulers.step()
 
         # Reduce the data collected over gradient accumulation steps.
@@ -942,6 +952,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         sl.log_trace_instant("training_start")
 
         self.checkpointer.load(step=config.checkpoint.load_step)
+        if self._cache_nvfp4_grouped_weights:
+            refresh_nvfp4_grouped_weight_caches(self.model_parts)
 
         # Capture loaded step for relative_step calculation.
         # After checkpoint load: self.step = restored step (e.g. 100), or 0 if fresh.

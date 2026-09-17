@@ -440,15 +440,133 @@ def test_nvfp4_grouped_experts_preserves_logical_tail_offset(monkeypatch):
         _sr_seed = torch.zeros(1, dtype=torch.int64)
         _kernel_preference = nvfp4_mod.KernelPreference.CUTEDSL
         _use_fast_math = True
+        _quantized_weight_cache = None
 
     A = torch.empty(384, 128)
     B_t = torch.empty(2, 128, 128)
     offs = torch.tensor([128, 256], dtype=torch.int32)
 
-    NVFP4Experts._grouped_mm(RuntimeState(), A=A, B_t=B_t, offs=offs)
+    NVFP4Experts._grouped_mm(RuntimeState(), A=A, B_t=B_t, offs=offs, weight_name="w1")
 
     assert forwarded["offs"] is offs
     assert offs[-1] < A.shape[0]
+
+
+def test_nvfp4_grouped_experts_cache_refresh_and_state_dict(monkeypatch):
+    pytest.importorskip("torchao")
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    if nvfp4_mod.NVFP4Linear is None:
+        pytest.skip("torchao NVFP4 training prototype not available")
+
+    generations = []
+
+    def quantize(weight, *, kernel_preference):
+        generation = torch.tensor(len(generations))
+        generations.append((weight, kernel_preference, generation))
+        return (generation,) * 5
+
+    monkeypatch.setattr(nvfp4_mod, "quantize_nvfp4_grouped_weight", quantize)
+    NVFP4Experts = nvfp4_mod._get_nvfp4_grouped_experts_cls(GroupedExperts)
+    experts = NVFP4Experts(
+        NVFP4Experts.Config(
+            dim=4,
+            hidden_dim=8,
+            num_experts=2,
+            kernel_preference="triton",
+            cache_quantized_weights=True,
+        )
+    )
+
+    experts.refresh_quantized_weight_cache()
+    first_cache = experts._quantized_weight_cache
+    assert set(first_cache) == {"w1", "w2", "w3"}
+    assert len(generations) == 3
+    assert not any("quantized_weight_cache" in key for key in experts.state_dict())
+
+    experts.refresh_quantized_weight_cache()
+    assert experts._quantized_weight_cache is not first_cache
+    assert len(generations) == 6
+
+
+def test_nvfp4_cache_refresh_unshards_owners_sequentially(monkeypatch):
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    events = []
+
+    class FakeFSDP(torch.nn.Module):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+            self.cache = FakeCache(name)
+
+        def unshard(self):
+            events.append(f"unshard:{self.name}")
+
+        def reshard(self):
+            events.append(f"reshard:{self.name}")
+
+    class FakeCache(torch.nn.Module):
+        def __init__(self, name):
+            super().__init__()
+            self.name = name
+            self._quantized_weight_cache = {}
+
+        def refresh_quantized_weight_cache(self):
+            events.append(f"refresh:{self.name}")
+
+    monkeypatch.setattr(nvfp4_mod, "FSDPModule", FakeFSDP)
+    model = torch.nn.ModuleList([FakeFSDP("a"), FakeFSDP("b")])
+
+    nvfp4_mod.refresh_nvfp4_grouped_weight_caches([model])
+
+    assert events == [
+        "unshard:a",
+        "refresh:a",
+        "reshard:a",
+        "unshard:b",
+        "refresh:b",
+        "reshard:b",
+    ]
+
+
+def test_grouped_experts_route_stable_weight_names(monkeypatch):
+    from torchtitan.overrides import fused_swiglu as fused_swiglu_mod
+
+    monkeypatch.setattr(
+        fused_swiglu_mod, "silu_and_mul_op", lambda gate, up, offsets: gate * up
+    )
+    expert_cases = [
+        (
+            GroupedExperts(GroupedExperts.Config(dim=4, hidden_dim=8, num_experts=2)),
+            ["w1", "w3", "w2"],
+        ),
+        (
+            GptOssGroupedExperts(
+                GptOssGroupedExperts.Config(dim=4, hidden_dim=8, num_experts=2)
+            ),
+            ["mlp1", "mlp2"],
+        ),
+        (
+            fused_swiglu_mod.FusedGroupedExperts(
+                fused_swiglu_mod.FusedGroupedExperts.Config(
+                    dim=4, hidden_dim=8, num_experts=2
+                )
+            ),
+            ["w13", "w2"],
+        ),
+    ]
+
+    for experts, expected_names in expert_cases:
+        names = []
+
+        def grouped_mm(*, A, B_t, offs, weight_name):
+            names.append(weight_name)
+            return A.new_zeros(A.shape[0], B_t.shape[-1])
+
+        experts._grouped_mm = grouped_mm
+        experts(torch.randn(2, 4), torch.tensor([1, 1]))
+        assert names == expected_names
 
 
 def test_nvfp4_grouped_experts_converter_targets_leading_moe_layers(monkeypatch):
@@ -517,7 +635,9 @@ def test_nvfp4_grouped_experts_converter_targets_leading_moe_layers(monkeypatch)
     "recipe",
     [
         "deepseek_v3_debugmodel_nvfp4",
+        "deepseek_v3_debugmodel_nvfp4_weight_cache",
         "deepseek_v3_16b_nvfp4",
+        "deepseek_v3_16b_nvfp4_f0l5_weight_cache",
         "deepseek_v3_671b_12_layers_nvfp4_mixed",
         "deepseek_v3_671b_nvfp4_mixed",
     ],
@@ -543,3 +663,36 @@ def test_deepseek_v3_nvfp4_recipes_resolve(monkeypatch, recipe):
     config = ConfigManager().parse_args(["--module", "deepseek_v3", "--config", recipe])
     assert config.model_spec.name == "deepseek_v3"
     assert has_quantization(config.model_spec.model)
+
+
+def test_deepseek_v3_weight_cache_recipe_is_opt_in(monkeypatch):
+    pytest.importorskip("torchao")
+    import torchtitan.components.quantization.mx as mx_mod
+    import torchtitan.components.quantization.nvfp4 as nvfp4_mod
+
+    if nvfp4_mod.NVFP4Linear is None:
+        pytest.skip("torchao NVFP4 training prototype not available")
+    _bypass_nvfp4_hardware_gates(monkeypatch, nvfp4_mod)
+    monkeypatch.setattr(mx_mod, "has_cuda_capability", lambda *_: True)
+
+    cache_flags = {}
+    for recipe in (
+        "deepseek_v3_16b_nvfp4_f0l5",
+        "deepseek_v3_16b_nvfp4_f0l5_weight_cache",
+    ):
+        config = ConfigManager().parse_args(
+            ["--module", "deepseek_v3", "--config", recipe]
+        )
+        NVFP4Experts = nvfp4_mod._get_nvfp4_grouped_experts_cls(GroupedExperts)
+        cache_flags[recipe] = {
+            cfg.cache_quantized_weights
+            for _fqn, cfg, _parent, _attr in config.model_spec.model.traverse(
+                GroupedExperts.Config
+            )
+            if isinstance(cfg, NVFP4Experts.Config)
+        }
+
+    assert cache_flags == {
+        "deepseek_v3_16b_nvfp4_f0l5": {False},
+        "deepseek_v3_16b_nvfp4_f0l5_weight_cache": {True},
+    }

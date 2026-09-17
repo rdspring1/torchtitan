@@ -124,7 +124,9 @@ def deepseek_v3_debugmodel_mxfp8() -> Trainer.Config:
     return config
 
 
-def deepseek_v3_debugmodel_nvfp4() -> Trainer.Config:
+def deepseek_v3_debugmodel_nvfp4(
+    cache_quantized_weights: bool = False,
+) -> Trainer.Config:
     config = deepseek_v3_debugmodel()
     assert config.model_spec is not None
     model_compile_enabled = (
@@ -151,10 +153,17 @@ def deepseek_v3_debugmodel_nvfp4() -> Trainer.Config:
                 model_compile_enabled=model_compile_enabled,
                 fqns=fqns,
                 pad_multiple=128,
+                cache_quantized_weights=cache_quantized_weights,
             ),
         ],
     )
     return config
+
+
+deepseek_v3_debugmodel_nvfp4_weight_cache = partial(
+    deepseek_v3_debugmodel_nvfp4,
+    cache_quantized_weights=True,
+)
 
 
 def deepseek_v3_debugmodel_hybridep() -> Trainer.Config:
@@ -231,7 +240,10 @@ def deepseek_v3_16b_hybridep() -> Trainer.Config:
     return config
 
 
-def deepseek_v3_16b_nvfp4(bf16_tail_fraction: float = 0.0) -> Trainer.Config:
+def deepseek_v3_16b_nvfp4(
+    bf16_tail_fraction: float = 0.0,
+    cache_quantized_weights: bool = False,
+) -> Trainer.Config:
     config = deepseek_v3_16b()
     assert config.model_spec is not None
     # Assign compile BEFORE deriving the flag, matching
@@ -290,6 +302,7 @@ def deepseek_v3_16b_nvfp4(bf16_tail_fraction: float = 0.0) -> Trainer.Config:
                 model_compile_enabled=model_compile_enabled,
                 fqns=fqns,
                 pad_multiple=128,
+                cache_quantized_weights=cache_quantized_weights,
             ),
             # Attention in MXFP8, matching deepseek_v3_671b_nvfp4_mixed. This arm
             # exists to de-risk the 671B recipe, so the set of quantized modules
@@ -318,6 +331,14 @@ def deepseek_v3_16b_nvfp4(bf16_tail_fraction: float = 0.0) -> Trainer.Config:
 # config_name with getattr + callable (config/manager.py:144), which a partial
 # satisfies.
 deepseek_v3_16b_nvfp4_f0l5 = partial(deepseek_v3_16b_nvfp4, bf16_tail_fraction=0.15)
+
+# Opt-in comparison arm: identical to F0L5 except that routed-expert weight
+# quantization is refreshed once per optimizer update and reused in between.
+deepseek_v3_16b_nvfp4_f0l5_weight_cache = partial(
+    deepseek_v3_16b_nvfp4,
+    bf16_tail_fraction=0.15,
+    cache_quantized_weights=True,
+)
 
 
 def deepseek_v3_16b_minimal_async_ep() -> Trainer.Config:

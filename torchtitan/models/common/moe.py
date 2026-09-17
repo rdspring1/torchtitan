@@ -96,19 +96,29 @@ class GroupedExperts(Module):
                 A=x_RD.bfloat16(),
                 B_t=w1_EFD.bfloat16().transpose(-2, -1),
                 offs=offsets_E,
+                weight_name="w1",
             )
         )
         h_RF = h_RF * self._grouped_mm(
             A=x_RD.bfloat16(),
             B_t=w3_EFD.bfloat16().transpose(-2, -1),
             offs=offsets_E,
+            weight_name="w3",
         )
         return self._grouped_mm(
-            A=h_RF, B_t=w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E
+            A=h_RF,
+            B_t=w2_EDF.bfloat16().transpose(-2, -1),
+            offs=offsets_E,
+            weight_name="w2",
         ).type_as(x_RD)
 
     def _grouped_mm(
-        self, *, A: torch.Tensor, B_t: torch.Tensor, offs: torch.Tensor
+        self,
+        *,
+        A: torch.Tensor,
+        B_t: torch.Tensor,
+        offs: torch.Tensor,
+        weight_name: str,
     ) -> torch.Tensor:
         """Grouped matmul of ``A @ B_t`` with per-expert token offsets.
 

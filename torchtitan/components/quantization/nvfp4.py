@@ -22,6 +22,9 @@ from typing import cast
 
 import spmd_types as spmd
 import torch
+import torch.nn as nn
+from torch.distributed._composable.fsdp import FSDPModule
+from torch.distributed.tensor import DTensor
 
 from torchtitan.components.quantization import QuantizationConverter
 from torchtitan.distributed.parallel_dims import MeshAxisName
@@ -72,7 +75,9 @@ try:
         cutedsl_nvfp4_unavailable_reason,
     )
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_grouped_mm import (
+        NVFP4GroupedWeight,
         _to_nvfp4_rht_rs_then_scaled_grouped_mm,
+        quantize_nvfp4_grouped_weight,
     )
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_linear import (
         nvfp4_linear,
@@ -138,9 +143,11 @@ try:
                 "%s kernel_preference=auto: the backend follows the container, not "
                 "the recipe (%s), and the SR streams differ between backends.",
                 what,
-                "resolved per op"
-                if per_op
-                else ("cutedsl" if cutedsl_nvfp4_kernels_available() else "triton"),
+                (
+                    "resolved per op"
+                    if per_op
+                    else ("cutedsl" if cutedsl_nvfp4_kernels_available() else "triton")
+                ),
             )
 
     # The NVFP4 GEMM is a raw autograd Function that runs on local shards inside
@@ -452,10 +459,16 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
             use_fast_math: bool = True
             """Approximate-reciprocal RHT quantize, matching TE's NVTE_USE_FAST_MATH=1."""
 
+            cache_quantized_weights: bool = False
+            """Reuse expert-weight quantization until the next optimizer update."""
+
         def __init__(self, config: Config):
             super().__init__(config)
             self._kernel_preference = _to_kernel_preference(config.kernel_preference)
             self._use_fast_math = config.use_fast_math
+            self._quantized_weight_cache: dict[str, NVFP4GroupedWeight] | None = (
+                {} if config.cache_quantized_weights else None
+            )
             # Same buffer protocol as NVFP4Linear.__init__: register the runtime
             # buffers as None so _distribute_states skips them and
             # _init_self_buffers materializes them per rank on the real device.
@@ -494,7 +507,7 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
             dev = (
                 buffer_device
                 if buffer_device is not None
-                else cast(torch.Tensor, self.w1_EFD).device
+                else cast(torch.Tensor, next(self.parameters())).device
             )
             self._sr_seed = torch.randint(
                 -9_223_372_036_854_775_808,
@@ -508,10 +521,52 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
             )
             self._refresh_rht_sign_vector_tuple()
 
-        def _grouped_mm(self, *, A, B_t, offs):
+        def _grouped_weights(self) -> dict[str, torch.Tensor]:
+            if hasattr(self, "w13"):
+                w13 = self.w13
+                E, F, _, D = w13.shape
+                weights = {"w13": w13.reshape(E, F * 2, D), "w2": self.w2_EDF}
+            elif hasattr(self, "w1_EFD"):
+                weights = {
+                    "w1": self.w1_EFD,
+                    "w3": self.w3_EFD,
+                    "w2": self.w2_EDF,
+                }
+            else:
+                weights = {
+                    "mlp1": self.mlp1_weight_EGD,
+                    "mlp2": self.mlp2_weight_EDF,
+                }
+            return {
+                name: weight.to_local() if isinstance(weight, DTensor) else weight
+                for name, weight in weights.items()
+            }
+
+        @torch.no_grad()
+        def refresh_quantized_weight_cache(self) -> None:
+            assert self._quantized_weight_cache is not None
+            self._quantized_weight_cache = {
+                name: quantize_nvfp4_grouped_weight(
+                    weight, kernel_preference=self._kernel_preference
+                )
+                for name, weight in self._grouped_weights().items()
+            }
+
+        def _grouped_mm(self, *, A, B_t, offs, weight_name):
             # torchao's NVFP4 grouped MM takes the un-transposed weight B (E, N, K)
             # and uses the final dispatcher offset as the logical token bound. A may
             # have additional allocation capacity, which torchao leaves untouched.
+            if self._quantized_weight_cache is None:
+                return _to_nvfp4_rht_rs_then_scaled_grouped_mm(
+                    A,
+                    B_t.transpose(-2, -1),
+                    self.rht_sign_vector,
+                    self._sr_seed,
+                    offs=offs,
+                    pad_token_groups_for_grouped_mm=False,
+                    kernel_preference=self._kernel_preference,
+                    use_fast_math=self._use_fast_math,
+                )
             return _to_nvfp4_rht_rs_then_scaled_grouped_mm(
                 A,
                 B_t.transpose(-2, -1),
@@ -521,6 +576,7 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
                 pad_token_groups_for_grouped_mm=False,
                 kernel_preference=self._kernel_preference,
                 use_fast_math=self._use_fast_math,
+                quantized_weight=self._quantized_weight_cache[weight_name],
             )
 
     NVFP4GroupedExperts.__name__ = f"NVFP4{parent_cls.__name__}"
@@ -558,6 +614,9 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
 
         use_fast_math: bool = True
         """Approximate-reciprocal RHT quantize, matching TE's NVTE_USE_FAST_MATH=1."""
+
+        cache_quantized_weights: bool = False
+        """Cache routed-expert quantized weights for one optimizer generation."""
 
     def __init__(self, config: Config):
         self.config = config
@@ -605,9 +664,10 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
                 **{f.name: getattr(config, f.name) for f in fields(config)}
             )
             # The comprehension copies the parent GroupedExperts.Config fields
-            # only, so the two NVFP4-specific ones are set explicitly.
+            # only, so the three NVFP4-specific ones are set explicitly.
             new_config.kernel_preference = self.config.kernel_preference
             new_config.use_fast_math = self.config.use_fast_math
+            new_config.cache_quantized_weights = self.config.cache_quantized_weights
             if parent is None:
                 model_config = new_config
             elif isinstance(parent, list):
@@ -640,3 +700,30 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
             "grouped_mm ops"
         )
         return model_config
+
+
+@torch.no_grad()
+def refresh_nvfp4_grouped_weight_caches(model_parts: list[nn.Module]) -> None:
+    """Refresh enabled expert caches one owning FSDP unit at a time."""
+    grouped_by_owner: dict[FSDPModule | None, list[nn.Module]] = {}
+
+    def collect(module: nn.Module, owner: FSDPModule | None) -> None:
+        if isinstance(module, FSDPModule):
+            owner = module
+        if getattr(module, "_quantized_weight_cache", None) is not None:
+            grouped_by_owner.setdefault(owner, []).append(module)
+        for child in module.children():
+            collect(child, owner)
+
+    for model in model_parts:
+        collect(model, None)
+
+    for owner, modules in grouped_by_owner.items():
+        if owner is not None:
+            owner.unshard()
+        try:
+            for module in modules:
+                module.refresh_quantized_weight_cache()
+        finally:
+            if owner is not None:
+                owner.reshard()

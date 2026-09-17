@@ -556,12 +556,18 @@ class FusedGroupedExperts(GroupedExperts):
 
         w13_E_D_2F = w13.bfloat16().reshape(E, F * 2, D).transpose(-2, -1)
         gate_up_R2F = self._grouped_mm(
-            A=x_RD.bfloat16(), B_t=w13_E_D_2F, offs=offsets_E
+            A=x_RD.bfloat16(),
+            B_t=w13_E_D_2F,
+            offs=offsets_E,
+            weight_name="w13",
         )
         gate_RF, up_RF = gate_up_R2F.reshape(-1, F, 2).unbind(-1)
         h_RF = silu_and_mul_op(gate_RF, up_RF, offsets_E)
         return self._grouped_mm(
-            A=h_RF, B_t=w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E
+            A=h_RF,
+            B_t=w2_EDF.bfloat16().transpose(-2, -1),
+            offs=offsets_E,
+            weight_name="w2",
         ).type_as(x_RD)
 
     @staticmethod
