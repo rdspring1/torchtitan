@@ -641,7 +641,6 @@ def test_deepseek_v3_nvfp4_recipes_select_exact_modules(
 
     if recipe == "deepseek_v3_16b_nvfp4":
         assert config.lr_scheduler.warmup_steps == 200
-        assert not config.training.disable_cuda_graphs
         assert model_config.layers[0].feed_forward is not None
         assert all(
             not isinstance(linear_config, NVFP4Linear.Config)
@@ -657,7 +656,9 @@ def test_deepseek_v3_nvfp4_recipes_select_exact_modules(
                 GroupedExperts.Config
             )
         )
-        assert not config.training.disable_cuda_graphs
+        assert config.training.disable_cuda_graphs == (
+            recipe == "deepseek_v3_671b_nvfp4_mixed"
+        )
 
 
 def test_dropped_deepseek_v3_nvfp4_recipes_and_flavor_are_absent():
