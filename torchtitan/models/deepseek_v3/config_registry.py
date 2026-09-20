@@ -313,7 +313,18 @@ def deepseek_v3_671b(seq_len: int | None = None) -> Trainer.Config:
 def deepseek_v3_671b_nvfp4_mixed(seq_len: int | None = None) -> Trainer.Config:
     config = deepseek_v3_671b(seq_len=seq_len)
     config.compile = CompileConfig(components=["model", "loss"])
-    config.training.disable_cuda_graphs = False
+    # CUDA graph capture is off at 671B. An FSDP all-gather inside the captured
+    # region fails at step 2 with `DistBackendError: NCCL operation failed`,
+    # after which every subsequent call reports
+    # cudaErrorStreamCaptureInvalidated. Reproduced twice at 16 nodes, both
+    # runs dying at the same point with step-1 loss agreeing to five decimals.
+    # Disabling capture removes the failure and changes nothing numerically --
+    # step-1 loss is identical to the crashing runs.
+    #
+    # This is specific to 671B, not to NVFP4: deepseek_v3_16b_nvfp4 runs with
+    # capture enabled and is left alone. The difference here is the hybridep
+    # expert-parallel collectives that sit inside the captured region at EP 32.
+    config.training.disable_cuda_graphs = True
     assert config.model_spec is not None
     model_config = cast(DeepSeekV3Model.Config, config.model_spec.model)
     layer_fqns = nvfp4_bf16_tail_fqns(len(model_config.layers), bf16_tail_fraction=0.0)
