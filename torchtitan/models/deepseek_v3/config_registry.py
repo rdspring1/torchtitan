@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from functools import partial
 from typing import cast
 
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
@@ -36,12 +37,53 @@ from .model import DeepSeekV3Model
 
 _NVFP4_FFN_SUBMODULES = ("feed_forward.", "moe.shared_experts.")
 _NVFP4_FFN_SUBMODULES_NO_DENSE = ("moe.shared_experts.",)
+_NVFP4_FC1_LEAVES = ("w13",)
+_NVFP4_FC2_LEAVES = ("w2",)
 
 
 def _nvfp4_ffn_linear_fqns(
-    layer_fqns: list[str], submodules: tuple[str, ...]
+    layer_fqns: list[str],
+    submodules: tuple[str, ...],
+    leaves: tuple[str, ...] = (),
 ) -> list[str]:
-    return [f"{layer}{submodule}" for layer in layer_fqns for submodule in submodules]
+    prefixes = [
+        f"{layer}{submodule}" for layer in layer_fqns for submodule in submodules
+    ]
+    if not leaves:
+        return prefixes
+    return [f"{prefix}{leaf}" for prefix in prefixes for leaf in leaves]
+
+
+def _nvfp4_linear_converters(
+    *,
+    model_compile_enabled: bool,
+    layer_fqns: list[str],
+    submodules: tuple[str, ...],
+    fc1_recipe: str,
+    fc2_recipe: str,
+    backend: dict,
+) -> list[NVFP4LinearConverter.Config]:
+    if fc1_recipe == fc2_recipe:
+        return [
+            NVFP4LinearConverter.Config(
+                model_compile_enabled=model_compile_enabled,
+                fqns=_nvfp4_ffn_linear_fqns(layer_fqns, submodules),
+                recipe=fc1_recipe,
+                **backend,
+            )
+        ]
+    return [
+        NVFP4LinearConverter.Config(
+            model_compile_enabled=model_compile_enabled,
+            fqns=_nvfp4_ffn_linear_fqns(layer_fqns, submodules, leaves),
+            recipe=leaf_recipe,
+            **backend,
+        )
+        for leaves, leaf_recipe in (
+            (_NVFP4_FC1_LEAVES, fc1_recipe),
+            (_NVFP4_FC2_LEAVES, fc2_recipe),
+        )
+    ]
 
 
 def deepseek_v3_mxfp8_linear_converter_config(
@@ -237,7 +279,12 @@ def deepseek_v3_16b_hybridep(seq_len: int | None = None) -> Trainer.Config:
 
 
 def deepseek_v3_16b_nvfp4(
-    bf16_tail_fraction: float = 0.0, *, seq_len: int | None = None
+    bf16_tail_fraction: float = 0.0,
+    recipe: str = "v1",
+    fc2_recipe: str | None = None,
+    kernel_preference: str | None = None,
+    *,
+    seq_len: int | None = None,
 ) -> Trainer.Config:
     config = deepseek_v3_16b(seq_len=seq_len)
     config.compile = CompileConfig(components=["model", "loss"])
@@ -246,6 +293,10 @@ def deepseek_v3_16b_nvfp4(
     assert config.model_spec is not None
     model_config = cast(DeepSeekV3Model.Config, config.model_spec.model)
     layer_fqns = nvfp4_bf16_tail_fqns(len(model_config.layers), bf16_tail_fraction)
+    fc2_recipe = recipe if fc2_recipe is None else fc2_recipe
+    backend = (
+        {} if kernel_preference is None else {"kernel_preference": kernel_preference}
+    )
     config.model_spec = model_registry(
         "16B",
         seq_len=seq_len,
@@ -253,13 +304,20 @@ def deepseek_v3_16b_nvfp4(
         moe_comm_backend="hybridep",
         non_blocking_capacity_factor=0.1875,
         converters=[
-            NVFP4LinearConverter.Config(
+            *_nvfp4_linear_converters(
                 model_compile_enabled=True,
-                fqns=_nvfp4_ffn_linear_fqns(layer_fqns, _NVFP4_FFN_SUBMODULES_NO_DENSE),
+                layer_fqns=layer_fqns,
+                submodules=_NVFP4_FFN_SUBMODULES_NO_DENSE,
+                fc1_recipe=recipe,
+                fc2_recipe=fc2_recipe,
+                backend=backend,
             ),
             NVFP4GroupedExpertsConverter.Config(
                 model_compile_enabled=True,
                 fqns=layer_fqns,
+                fc1_recipe=recipe,
+                fc2_recipe=fc2_recipe,
+                **backend,
             ),
             MXFP8LinearConverter.Config(
                 model_compile_enabled=True,
@@ -268,6 +326,18 @@ def deepseek_v3_16b_nvfp4(
         ],
     )
     return config
+
+
+deepseek_v3_16b_nvfp4_f0l5 = partial(
+    deepseek_v3_16b_nvfp4, bf16_tail_fraction=0.15
+)
+deepseek_v3_16b_nvfp4_v1_requant = partial(
+    deepseek_v3_16b_nvfp4, recipe="v1_requant"
+)
+deepseek_v3_16b_nvfp4_v2 = partial(deepseek_v3_16b_nvfp4, recipe="v2")
+deepseek_v3_16b_nvfp4_split = partial(
+    deepseek_v3_16b_nvfp4, recipe="v1_requant", fc2_recipe="v2"
+)
 
 
 def deepseek_v3_671b(seq_len: int | None = None) -> Trainer.Config:
@@ -310,12 +380,22 @@ def deepseek_v3_671b(seq_len: int | None = None) -> Trainer.Config:
     )
 
 
-def deepseek_v3_671b_nvfp4_mixed(seq_len: int | None = None) -> Trainer.Config:
+def deepseek_v3_671b_nvfp4_mixed(
+    recipe: str = "v1",
+    fc2_recipe: str | None = None,
+    kernel_preference: str | None = None,
+    *,
+    seq_len: int | None = None,
+) -> Trainer.Config:
     config = deepseek_v3_671b(seq_len=seq_len)
     config.compile = CompileConfig(components=["model", "loss"])
     assert config.model_spec is not None
     model_config = cast(DeepSeekV3Model.Config, config.model_spec.model)
     layer_fqns = nvfp4_bf16_tail_fqns(len(model_config.layers), bf16_tail_fraction=0.0)
+    fc2_recipe = recipe if fc2_recipe is None else fc2_recipe
+    backend = (
+        {} if kernel_preference is None else {"kernel_preference": kernel_preference}
+    )
     config.model_spec = model_registry(
         "671B",
         seq_len=seq_len,
@@ -323,13 +403,20 @@ def deepseek_v3_671b_nvfp4_mixed(seq_len: int | None = None) -> Trainer.Config:
         moe_comm_backend="hybridep",
         non_blocking_capacity_factor=0.03125,
         converters=[
-            NVFP4LinearConverter.Config(
+            *_nvfp4_linear_converters(
                 model_compile_enabled=True,
-                fqns=_nvfp4_ffn_linear_fqns(layer_fqns, _NVFP4_FFN_SUBMODULES),
+                layer_fqns=layer_fqns,
+                submodules=_NVFP4_FFN_SUBMODULES,
+                fc1_recipe=recipe,
+                fc2_recipe=fc2_recipe,
+                backend=backend,
             ),
             NVFP4GroupedExpertsConverter.Config(
                 model_compile_enabled=True,
                 fqns=layer_fqns,
+                fc1_recipe=recipe,
+                fc2_recipe=fc2_recipe,
+                **backend,
             ),
             MXFP8LinearConverter.Config(
                 model_compile_enabled=True,
@@ -338,6 +425,17 @@ def deepseek_v3_671b_nvfp4_mixed(seq_len: int | None = None) -> Trainer.Config:
         ],
     )
     return config
+
+
+deepseek_v3_671b_nvfp4_v1_requant = partial(
+    deepseek_v3_671b_nvfp4_mixed, recipe="v1_requant"
+)
+deepseek_v3_671b_nvfp4_v2 = partial(
+    deepseek_v3_671b_nvfp4_mixed, recipe="v2"
+)
+deepseek_v3_671b_nvfp4_split = partial(
+    deepseek_v3_671b_nvfp4_mixed, recipe="v1_requant", fc2_recipe="v2"
+)
 
 
 def deepseek_v3_671b_float8(seq_len: int | None = None) -> Trainer.Config:
