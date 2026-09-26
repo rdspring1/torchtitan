@@ -461,7 +461,14 @@ class NVFP4LinearConverter(QuantizationConverter):
         kernel_preference: str = "cutedsl"
         use_fast_math: bool = True
         recipe: Literal["v1", "v1_requant", "v2"] = "v1"
-        ms_eden_fast_path: bool = True
+        ms_eden_fast_path: bool | None = None
+        """
+        Round the backward's MS-EDEN scales in hardware (cvt.rs). The fast path
+        exists only on the V2 kernels, so None -- the default -- means on for
+        recipe='v2' and off for everything else. Set it explicitly only to turn
+        a V2 recipe back off; an explicit True on a non-V2 recipe still raises,
+        because it cannot be honored.
+        """
 
     def __init__(self, config: Config):
         self.config = config
@@ -480,6 +487,14 @@ class NVFP4LinearConverter(QuantizationConverter):
             logger.warning(
                 "torch.compile enablement is required for highest performance "
                 "of NVFP4 dynamic quantization."
+            )
+
+        if self.config.ms_eden_fast_path is None:
+            # Resolve rather than raise: the fast path is CuteDSL-only, so a
+            # Triton-backed V2 config must resolve to off, not to an error.
+            self.config.ms_eden_fast_path = (
+                self.config.recipe == "v2"
+                and self.config.kernel_preference == "cutedsl"
             )
 
         if self.config.ms_eden_fast_path and (
@@ -550,7 +565,11 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
         use_fast_math: bool = True
         fc1_recipe: Literal["v1", "v1_requant", "v2"] = "v1"
         fc2_recipe: Literal["v1", "v1_requant", "v2"] = "v1"
-        ms_eden_fast_path: bool = True
+        ms_eden_fast_path: bool | None = None
+        """
+        See NVFP4LinearConverter.Config.ms_eden_fast_path. None means on when
+        either fc1_recipe or fc2_recipe is 'v2'.
+        """
 
         def __post_init__(self) -> None:
             if self.pad_multiple <= 0 or self.pad_multiple % 128:
@@ -586,6 +605,12 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
         self._kernel_preference = _to_kernel_preference(
             self.config.kernel_preference
         )
+        if self.config.ms_eden_fast_path is None:
+            self.config.ms_eden_fast_path = (
+                "v2" in (self.config.fc1_recipe, self.config.fc2_recipe)
+                and self.config.kernel_preference == "cutedsl"
+            )
+
         if self.config.ms_eden_fast_path and (
             self.config.kernel_preference != "cutedsl"
             or "v2" not in (self.config.fc1_recipe, self.config.fc2_recipe)
