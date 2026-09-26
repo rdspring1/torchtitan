@@ -20,6 +20,7 @@ from torch.distributed.elastic.multiprocessing.errors import record
 
 from torchtitan.components.data.loader import BaseDataLoader, DataloaderExhaustedError
 from torchtitan.components.data.types import TrainingMicrobatch
+from torchtitan.quantization.nvfp4 import build_nvfp4_sign_resampler
 from torchtitan.components.tokenizer import BaseTokenizer, HuggingFaceTokenizer
 from torchtitan.components.validate import BaseValidator, Validator
 from torchtitan.config import Configurable
@@ -254,6 +255,10 @@ class Trainer(Configurable):
             ),
             create_seed_checkpoint=config.create_seed_checkpoint,
         )
+        self._nvfp4_resample = build_nvfp4_sign_resampler(
+            engine.model_parts,
+            seed=config.debug.seed if config.debug.seed is not None else 0,
+        )
 
         if parallel_dims.pp_enabled:
             ensure_pp_loss_visible(
@@ -390,6 +395,8 @@ class Trainer(Configurable):
         # Process each gradient accumulation step, then free its inputs.
         accumulated_loss: torch.Tensor | None = None
         for fwd_bwd_index, microbatch_group in enumerate(microbatch_groups):
+            if self._nvfp4_resample is not None:
+                self._nvfp4_resample(engine.num_completed_steps, fwd_bwd_index)
             detached_loss = engine.forward_backward_microbatch(
                 microbatch_group=microbatch_group,
                 global_valid_tokens=global_valid_tokens,
