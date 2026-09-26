@@ -7,6 +7,7 @@
 """Quantization model-config converters."""
 
 import logging
+import math
 from dataclasses import dataclass, field, fields
 from functools import partial
 from importlib.util import find_spec
@@ -457,6 +458,11 @@ class NVFP4LinearConverter(QuantizationConverter):
         the LM head in bf16, which the mixed recipe leaves unquantized for stability.
         """
 
+        kernel_preference: str = "cutedsl"
+        use_fast_math: bool = True
+        recipe: Literal["v1", "v1_requant", "v2"] = "v1"
+        ms_eden_fast_path: bool = False
+
     def __init__(self, config: Config):
         self.config = config
 
@@ -476,6 +482,27 @@ class NVFP4LinearConverter(QuantizationConverter):
                 "of NVFP4 dynamic quantization."
             )
 
+        if self.config.ms_eden_fast_path and (
+            self.config.kernel_preference != "cutedsl" or self.config.recipe != "v2"
+        ):
+            raise ValueError(
+                "NVFP4Linear ms_eden_fast_path=True requires kernel_preference="
+                "'cutedsl' and recipe='v2'; got kernel_preference="
+                f"{self.config.kernel_preference!r}, recipe={self.config.recipe!r}."
+            )
+        from torchtitan.quantization.nvfp4 import (
+            _log_kernel_preference,
+            _to_kernel_preference,
+        )
+
+        _log_kernel_preference(
+            f"NVFP4Linear recipe={self.config.recipe}",
+            _to_kernel_preference(self.config.kernel_preference),
+            self.config.use_fast_math,
+            self.config.ms_eden_fast_path,
+            per_op=False,
+        )
+
     def convert(self, model_config):
         assert NVFP4Linear is not None
         fqns = self.config.fqns
@@ -492,6 +519,10 @@ class NVFP4LinearConverter(QuantizationConverter):
                     num_linears=config.num_linears,
                     bias=config.bias,
                     param_init=config.param_init,
+                    kernel_preference=self.config.kernel_preference,
+                    use_fast_math=self.config.use_fast_math,
+                    recipe=self.config.recipe,
+                    ms_eden_fast_path=self.config.ms_eden_fast_path,
                 )
                 if parent is None:
                     model_config = new_config
@@ -514,6 +545,12 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
 
         pad_multiple: int = 128
         """Per-expert token-group alignment required by NVFP4 grouped GEMMs."""
+
+        kernel_preference: str = "cutedsl"
+        use_fast_math: bool = True
+        fc1_recipe: Literal["v1", "v1_requant", "v2"] = "v1"
+        fc2_recipe: Literal["v1", "v1_requant", "v2"] = "v1"
+        ms_eden_fast_path: bool = False
 
         def __post_init__(self) -> None:
             if self.pad_multiple <= 0 or self.pad_multiple % 128:
@@ -541,6 +578,34 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
                 "of NVFP4 dynamic quantization."
             )
 
+        from torchtitan.quantization.nvfp4 import (
+            _log_kernel_preference,
+            _to_kernel_preference,
+        )
+
+        self._kernel_preference = _to_kernel_preference(
+            self.config.kernel_preference
+        )
+        if self.config.ms_eden_fast_path and (
+            self.config.kernel_preference != "cutedsl"
+            or "v2" not in (self.config.fc1_recipe, self.config.fc2_recipe)
+        ):
+            raise ValueError(
+                "NVFP4GroupedExperts ms_eden_fast_path=True requires "
+                "kernel_preference='cutedsl' and 'v2' on fc1_recipe or fc2_recipe; "
+                f"got kernel_preference={self.config.kernel_preference!r}, "
+                f"fc1_recipe={self.config.fc1_recipe!r}, "
+                f"fc2_recipe={self.config.fc2_recipe!r}."
+            )
+        _log_kernel_preference(
+            f"NVFP4GroupedExperts fc1={self.config.fc1_recipe} "
+            f"fc2={self.config.fc2_recipe}",
+            self._kernel_preference,
+            self.config.use_fast_math,
+            self.config.ms_eden_fast_path,
+            per_op=True,
+        )
+
     def convert(self, model_config):
         fqns = self.config.fqns
         targets = [
@@ -563,6 +628,11 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
             config_cls = quantized_cls.Config  # type: ignore[attr-defined]
             new_config = config_cls(
                 **{f.name: getattr(config, f.name) for f in fields(config)},
+                kernel_preference=self.config.kernel_preference,
+                use_fast_math=self.config.use_fast_math,
+                fc1_recipe=self.config.fc1_recipe,
+                fc2_recipe=self.config.fc2_recipe,
+                ms_eden_fast_path=self.config.ms_eden_fast_path,
             )
             if parent is None:
                 model_config = new_config
@@ -570,6 +640,22 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
                 parent[attr] = new_config
             else:
                 setattr(parent, attr, new_config)
+
+        if targets and self._kernel_preference.value == "cutedsl":
+            from torchao.prototype.moe_training.nvfp4_training._cutedsl_group_kernels_impl import (
+                MAX_GROUPS,
+            )
+
+            num_experts = max(config.num_experts for _, config, _, _ in targets)
+            if num_experts > MAX_GROUPS:
+                logger.warning(
+                    "NVFP4GroupedExperts kernel_preference=cutedsl with %d experts "
+                    "requires expert_parallel_degree >= %d: the CuteDSL grouped "
+                    "kernel takes at most %d experts per rank and raises otherwise.",
+                    num_experts,
+                    math.ceil(num_experts / MAX_GROUPS),
+                    MAX_GROUPS,
+                )
 
         logger.info(
             "Converted GroupedExperts to use dynamic NVFP4 quantization for "

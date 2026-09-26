@@ -16,6 +16,7 @@ parallelism the block boundary keeps its stock bf16 collectives (all-gather /
 reduce-scatter); NVFP4 does not move fp4 codes over the wire.
 """
 
+import logging
 import math
 from dataclasses import dataclass, replace
 from typing import cast
@@ -25,12 +26,14 @@ import torch
 from spmd_types import SpmdType
 
 from torchtitan.distributed.parallel_dims import MeshAxisName
+from torchtitan.distributed.spmd_types import spmd_mesh_size
 from torchtitan.models.common.decoder_sharding import dense_activation_placement
 from torchtitan.models.common.linear import Linear
 from torchtitan.protocols.module import Module
 
 
 TP = MeshAxisName.TP
+logger = logging.getLogger(__name__)
 
 # TorchAO's NVFP4 Triton kernels require each local GEMM dimension to be a
 # multiple of 128.
@@ -61,25 +64,92 @@ _HARDCODED_SIGN_VECTOR = (
     -1,
 )
 
+_NVFP4_RECIPES = ("v1", "v1_requant", "v2")
+_V2_RHT_SIZE = 128
+_V2_LINEAR_WGRAD_SEED = 0x1EA1
+_V2_LINEAR_DGRAD_SEED = 0x1EA2
+
 try:
+    from torchao.prototype.moe_training.nvfp4_training.hadamard_cutedsl_utils import (
+        cutedsl_nvfp4_kernels_available,
+        cutedsl_nvfp4_unavailable_reason,
+    )
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_grouped_mm import (
         _to_nvfp4_rht_rs_then_scaled_grouped_mm,
     )
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_linear import (
         nvfp4_linear,
-        nvfp4_mm_triton,
+        nvfp4_matmul,
     )
+    from torchao.prototype.moe_training.nvfp4_training.nvfp4_linear_v2 import (
+        _NVFP4LinearV1Requant,
+        _NVFP4LinearV2,
+        nvfp4_linear_v1_requant,
+        nvfp4_linear_v2,
+    )
+    from torchao.prototype.moe_training.nvfp4_training.nvfp4_recipe import NVFP4Recipe
     from torchao.prototype.moe_training.nvfp4_training.nvfp4_training import (
         _make_rht_sign_vector,
         _rht_sign_vector_to_tuple,
         NVFP4Linear as TorchAONVFP4Linear,
     )
+    from torchao.quantization.quantize_.common import KernelPreference
+
+    _SUPPORTED_KERNEL_PREFERENCES = (
+        KernelPreference.AUTO,
+        KernelPreference.TRITON,
+        KernelPreference.CUTEDSL,
+    )
+
+    def _to_kernel_preference(name: str) -> KernelPreference:
+        try:
+            pref = KernelPreference(name)
+        except ValueError:
+            pref = None
+        if pref not in _SUPPORTED_KERNEL_PREFERENCES:
+            raise ValueError(
+                "NVFP4 kernel_preference must be one of "
+                f"{[p.value for p in _SUPPORTED_KERNEL_PREFERENCES]}, got {name!r}"
+            )
+        return pref
+
+    def _log_kernel_preference(
+        what: str,
+        pref: KernelPreference,
+        use_fast_math: bool,
+        ms_eden_fast_path: bool,
+        *,
+        per_op: bool,
+    ) -> None:
+        if pref is KernelPreference.CUTEDSL and not cutedsl_nvfp4_kernels_available():
+            raise RuntimeError(
+                f"{what} kernel_preference=cutedsl, but the CuteDSL runtime is "
+                f"unavailable ({cutedsl_nvfp4_unavailable_reason()})."
+            )
+        logger.info(
+            "%s kernel_preference=%s, use_fast_math=%s, ms_eden_fast_path=%s",
+            what,
+            pref.value,
+            use_fast_math,
+            ms_eden_fast_path,
+        )
+        if pref is KernelPreference.AUTO:
+            logger.warning(
+                "%s kernel_preference=auto: the backend follows the container, not "
+                "the recipe (%s), and the SR streams differ between backends.",
+                what,
+                "resolved per op"
+                if per_op
+                else ("cutedsl" if cutedsl_nvfp4_kernels_available() else "triton"),
+            )
 
     # The NVFP4 GEMM is a raw autograd Function that runs on local shards inside
     # the local SPMD region. Mark it local-safe so SPMD type checking
     # propagates through it; the region boundary declares the real
     # colwise/rowwise output type.
-    spmd.register_local_autograd_function(nvfp4_mm_triton)
+    spmd.register_local_autograd_function(nvfp4_matmul)
+    spmd.register_local_autograd_function(_NVFP4LinearV1Requant)
+    spmd.register_local_autograd_function(_NVFP4LinearV2)
 
     class NVFP4Linear(TorchAONVFP4Linear, Module):
         """NVFP4 Linear satisfying torchtitan's Module protocol.
@@ -95,7 +165,16 @@ try:
         class Config(Linear.Config):
             """Drop-in replacement for Linear.Config that builds NVFP4Linear."""
 
+            kernel_preference: str = "cutedsl"
+            use_fast_math: bool = True
+            recipe: str = "v1"
+            ms_eden_fast_path: bool = False
+
             def __post_init__(self) -> None:
+                if self.recipe not in _NVFP4_RECIPES:
+                    raise ValueError(
+                        f"recipe must be one of {_NVFP4_RECIPES}, got {self.recipe!r}"
+                    )
                 # NVFP4's Triton kernels need every GEMM dim to be a multiple of
                 # 128. in_features / out_features are known at config-build time
                 # (the TP degree is not), so reject the model-dim violations up
@@ -155,13 +234,17 @@ try:
                     )
                 return instance
 
-        def __init__(self, config: Linear.Config):
+        def __init__(self, config: Config):
             TorchAONVFP4Linear.__init__(
                 self,
                 config.in_features,
                 config.num_linears * config.out_features,
                 bias=config.bias,
+                kernel_preference=_to_kernel_preference(config.kernel_preference),
+                use_fast_math=config.use_fast_math,
+                recipe=NVFP4Recipe(config.recipe),
             )
+            self.ms_eden_fast_path = config.ms_eden_fast_path
             self.out_features = config.out_features
             self.num_linears = config.num_linears
             if config.num_linears > 1:
@@ -196,6 +279,8 @@ try:
             # deterministic constant needs no checkpointing) and re-materialized
             # per rank in _init_self_buffers with no cross-rank broadcast.
             self.register_buffer("_rht_sign_vector", None, persistent=False)
+            if self.recipe is NVFP4Recipe.V2:
+                self.register_buffer("_dgrad_rht_sign_vector", None, persistent=False)
             self._rht_sign_vector_tuple = None
 
         def _local_rht_sign_vector(self) -> torch.Tensor:
@@ -205,6 +290,9 @@ try:
             return sign_vector
 
         def _refresh_rht_sign_vector_tuple(self) -> None:
+            if self.recipe is NVFP4Recipe.V2:
+                self._rht_sign_vector_tuple = None
+                return
             sign_vector = self._local_rht_sign_vector()
             self._rht_sign_vector_tuple = (
                 None if sign_vector is None else _rht_sign_vector_to_tuple(sign_vector)
@@ -239,11 +327,17 @@ try:
                 dtype=torch.int64,
                 device=dev,
             )
-            # Static RHT basis: identical on every rank by construction, so it is
-            # a plain local tensor with no cross-rank broadcast.
-            self._rht_sign_vector = _make_rht_sign_vector(
-                _HARDCODED_SIGN_VECTOR, device=dev
-            )
+            if self.recipe is NVFP4Recipe.V2:
+                self._rht_sign_vector = _draw_sign_vector(
+                    _V2_RHT_SIZE, _V2_LINEAR_WGRAD_SEED, dev
+                )
+                self._dgrad_rht_sign_vector = _draw_sign_vector(
+                    _V2_RHT_SIZE, _V2_LINEAR_DGRAD_SEED, dev
+                )
+            else:
+                self._rht_sign_vector = _make_rht_sign_vector(
+                    _HARDCODED_SIGN_VECTOR, device=dev
+                )
             self._refresh_rht_sign_vector_tuple()
 
         def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -257,13 +351,38 @@ try:
                 )
             weight = self.weight.flatten(0, -2)
             bias = None if self.bias is None else self.bias.flatten()
-            output = nvfp4_linear(
-                input,
-                weight,
-                bias,
-                sr_seed=self._sr_seed,
-                sign_vector=self.rht_sign_vector,
-            )
+            if self.recipe is NVFP4Recipe.V2:
+                output = nvfp4_linear_v2(
+                    input,
+                    weight,
+                    bias,
+                    wgrad_rht=self._rht_sign_vector,
+                    dgrad_rht=self._dgrad_rht_sign_vector,
+                    sr_seed=self._sr_seed,
+                    kernel_preference=self.kernel_preference,
+                    use_fast_math=self.use_fast_math,
+                    ms_eden_fast_path=self.ms_eden_fast_path,
+                )
+            elif self.recipe is NVFP4Recipe.V1_REQUANT:
+                output = nvfp4_linear_v1_requant(
+                    input,
+                    weight,
+                    bias,
+                    sign_vector=self.rht_sign_vector,
+                    sr_seed=self._sr_seed,
+                    kernel_preference=self.kernel_preference,
+                    use_fast_math=self.use_fast_math,
+                )
+            else:
+                output = nvfp4_linear(
+                    input,
+                    weight,
+                    bias,
+                    sr_seed=self._sr_seed,
+                    sign_vector=self.rht_sign_vector,
+                    kernel_preference=self.kernel_preference,
+                    use_fast_math=self.use_fast_math,
+                )
             if self.num_linears == 1:
                 return output
             return output.unflatten(-1, self.weight.shape[:-1])
@@ -273,6 +392,69 @@ try:
 
 except ImportError:
     NVFP4Linear = None
+
+
+def _draw_sign_vector(length: int, seed: int, device) -> torch.Tensor:
+    """Draw a deterministic {-1, +1} vector shared by ranks."""
+    generator = torch.Generator().manual_seed(seed)
+    bits = torch.randint(0, 2, (length,), generator=generator, dtype=torch.int8)
+    return (bits * 2 - 1).to(device)
+
+
+def _expects_v2(module) -> bool:
+    recipe = getattr(module, "recipe", None)
+    if recipe is not None and getattr(recipe, "value", recipe) == "v2":
+        return True
+    return "v2" in (
+        getattr(module, "_fc1_recipe", None),
+        getattr(module, "_fc2_recipe", None),
+    )
+
+
+def build_nvfp4_sign_resampler(model_parts, seed: int):
+    """Build the V2 RHT sign cadence after model buffers are materialized."""
+    try:
+        from torchao.prototype.moe_training.nvfp4_training.nvfp4_rht_cadence import (
+            iter_dynamic_sign_buffers,
+            resample_nvfp4_rht_signs,
+        )
+    except ImportError:
+        return None
+
+    strays = [
+        f"{fqn}.{name}"
+        for part in model_parts
+        for fqn, name, _, _ in iter_dynamic_sign_buffers(part)
+        if not _expects_v2(part.get_submodule(fqn))
+    ]
+    if strays:
+        logger.warning(
+            "NVFP4: %d dynamic RHT sign buffers sit on modules that do not run "
+            "V2 (e.g. %s); they will be resampled but not read.",
+            len(strays),
+            strays[0],
+        )
+
+    counts = [sum(1 for _ in iter_dynamic_sign_buffers(part)) for part in model_parts]
+    total = sum(counts)
+    if not total:
+        if any(_expects_v2(module) for part in model_parts for module in part.modules()):
+            logger.warning(
+                "NVFP4: a V2 recipe is configured but no dynamic RHT sign buffers "
+                "were found; this run does not measure V2."
+            )
+        return None
+
+    parts = [part for part, count in zip(model_parts, counts, strict=True) if count]
+    logger.info("NVFP4 V2: resampling %d RHT sign buffers per microbatch", total)
+
+    def resample(step: int, microbatch: int) -> None:
+        for part in parts:
+            resample_nvfp4_rht_signs(
+                part, seed=seed, step=step, microbatch=microbatch
+            )
+
+    return resample
 
 
 _nvfp4_experts_cache: dict[type, type] = {}
@@ -288,13 +470,33 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
     class NVFP4GroupedExperts(parent_cls):  # type: ignore[valid-type, misc]
         @dataclass(kw_only=True, slots=True)
         class Config(parent_config_cls):  # type: ignore[misc]
-            pass
+            kernel_preference: str = "cutedsl"
+            use_fast_math: bool = True
+            fc1_recipe: str = "v1"
+            fc2_recipe: str = "v1"
+            ms_eden_fast_path: bool = False
 
         def __init__(self, config: Config):
             super().__init__(config)
+            self._kernel_preference = _to_kernel_preference(config.kernel_preference)
+            self._use_fast_math = config.use_fast_math
+            self._ms_eden_fast_path = config.ms_eden_fast_path
+            for name in ("fc1_recipe", "fc2_recipe"):
+                value = getattr(config, name)
+                if value not in _NVFP4_RECIPES:
+                    raise ValueError(
+                        f"{name} must be one of {_NVFP4_RECIPES}, got {value!r}"
+                    )
+            self._fc1_recipe = config.fc1_recipe
+            self._fc2_recipe = config.fc2_recipe
             module = cast(Module, self)
             module.register_buffer("_sr_seed", None, persistent=False)
             module.register_buffer("_rht_sign_vector", None, persistent=False)
+            module.register_buffer("_fc2_sr_seed", None, persistent=False)
+            module.register_buffer("_fc2_rht_sign_vector", None, persistent=False)
+            module.register_buffer(
+                "_fc2_dgrad_rht_sign_vector", None, persistent=False
+            )
             self._rht_sign_vector_tuple = None
 
         def _refresh_rht_sign_vector_tuple(self) -> None:
@@ -337,6 +539,20 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
                 _HARDCODED_SIGN_VECTOR, device=dev
             )
             self._refresh_rht_sign_vector_tuple()
+            self._fc2_sr_seed = torch.randint(
+                -9_223_372_036_854_775_808,
+                9_223_372_036_854_775_807,
+                (1,),
+                dtype=torch.int64,
+                device=dev,
+            )
+            if _expects_v2(self):
+                self._fc2_rht_sign_vector = _draw_sign_vector(
+                    _V2_RHT_SIZE, 0xFC2, dev
+                )
+                self._fc2_dgrad_rht_sign_vector = _draw_sign_vector(
+                    _V2_RHT_SIZE, 0xDEAD, dev
+                )
 
         def _grouped_mm(self, *, A, weight_EOI, offs):
             return _to_nvfp4_rht_rs_then_scaled_grouped_mm(
@@ -346,7 +562,85 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
                 self._sr_seed,
                 offs=offs,
                 pad_token_groups_for_grouped_mm=False,
+                kernel_preference=self._kernel_preference,
+                use_fast_math=self._use_fast_math,
             )
+
+        def _recipe_grouped_mm(self, recipe, A, weight_EOI, offs, *, is_fc2):
+            from torchao.prototype.moe_training.nvfp4_training.nvfp4_grouped_mm_v2 import (
+                nvfp4_v1_requant_grouped_mm,
+                nvfp4_v2_grouped_mm,
+            )
+
+            seed = self._fc2_sr_seed if is_fc2 else self._sr_seed
+            if recipe == "v1":
+                return _to_nvfp4_rht_rs_then_scaled_grouped_mm(
+                    A,
+                    weight_EOI,
+                    self.rht_sign_vector,
+                    seed,
+                    offs=offs,
+                    pad_token_groups_for_grouped_mm=False,
+                    kernel_preference=self._kernel_preference,
+                    use_fast_math=self._use_fast_math,
+                )
+            if recipe == "v1_requant":
+                return nvfp4_v1_requant_grouped_mm(
+                    A,
+                    weight_EOI,
+                    sign_vector=self.rht_sign_vector,
+                    sr_seed=seed,
+                    offs=offs,
+                    pad_token_groups_for_grouped_mm=False,
+                    kernel_preference=self._kernel_preference,
+                    use_fast_math=self._use_fast_math,
+                )
+            return nvfp4_v2_grouped_mm(
+                A,
+                weight_EOI,
+                wgrad_rht=self._fc2_rht_sign_vector,
+                dgrad_rht=self._fc2_dgrad_rht_sign_vector,
+                sr_seed=seed,
+                offs=offs,
+                pad_token_groups_for_grouped_mm=False,
+                kernel_preference=self._kernel_preference,
+                use_fast_math=self._use_fast_math,
+                ms_eden_fast_path=self._ms_eden_fast_path,
+            )
+
+        def forward(self, x_RD, num_tokens_per_expert_E):
+            if self._fc1_recipe == "v1" and self._fc2_recipe == "v1":
+                return super().forward(x_RD, num_tokens_per_expert_E)
+
+            offsets_E = torch.cumsum(
+                num_tokens_per_expert_E, dim=0, dtype=torch.int32
+            )
+            if spmd.is_type_checking() and spmd_mesh_size("ep") == 1:
+                for axis in ("dp", "cp"):
+                    spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
+
+            gate_RF = self._recipe_grouped_mm(
+                self._fc1_recipe,
+                x_RD.bfloat16(),
+                self.w1_EFD,
+                offsets_E,
+                is_fc2=False,
+            )
+            up_RF = self._recipe_grouped_mm(
+                self._fc1_recipe,
+                x_RD.bfloat16(),
+                self.w3_EFD,
+                offsets_E,
+                is_fc2=False,
+            )
+            h_RF = self.activation_fn(gate_RF, up_RF)
+            return self._recipe_grouped_mm(
+                self._fc2_recipe,
+                h_RF,
+                self.w2_EDF,
+                offsets_E,
+                is_fc2=True,
+            ).type_as(x_RD)
 
     NVFP4GroupedExperts.__name__ = f"NVFP4{parent_cls.__name__}"
     NVFP4GroupedExperts.__qualname__ = f"NVFP4{parent_cls.__name__}"
