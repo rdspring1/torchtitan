@@ -168,7 +168,7 @@ try:
             kernel_preference: str = "cutedsl"
             use_fast_math: bool = True
             recipe: str = "v1"
-            ms_eden_fast_path: bool = False
+            ms_eden_fast_path: bool = True
 
             def __post_init__(self) -> None:
                 if self.recipe not in _NVFP4_RECIPES:
@@ -474,7 +474,7 @@ def _get_nvfp4_grouped_experts_cls(parent_cls: type) -> type:
             use_fast_math: bool = True
             fc1_recipe: str = "v1"
             fc2_recipe: str = "v1"
-            ms_eden_fast_path: bool = False
+            ms_eden_fast_path: bool = True
 
         def __init__(self, config: Config):
             super().__init__(config)
