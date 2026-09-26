@@ -461,7 +461,7 @@ class NVFP4LinearConverter(QuantizationConverter):
         kernel_preference: str = "cutedsl"
         use_fast_math: bool = True
         recipe: Literal["v1", "v1_requant", "v2"] = "v1"
-        ms_eden_fast_path: bool = False
+        ms_eden_fast_path: bool = True
 
     def __init__(self, config: Config):
         self.config = config
@@ -550,7 +550,7 @@ class NVFP4GroupedExpertsConverter(QuantizationConverter):
         use_fast_math: bool = True
         fc1_recipe: Literal["v1", "v1_requant", "v2"] = "v1"
         fc2_recipe: Literal["v1", "v1_requant", "v2"] = "v1"
-        ms_eden_fast_path: bool = False
+        ms_eden_fast_path: bool = True
 
         def __post_init__(self) -> None:
             if self.pad_multiple <= 0 or self.pad_multiple % 128:
