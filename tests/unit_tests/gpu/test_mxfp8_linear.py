@@ -492,7 +492,7 @@ def test_fsdp_post_all_gather_drops_the_padding():
 
 
 def test_fsdp_hooks_support_a_non_zero_shard_dim():
-    """Structured weights move their sharded matrix axis to the gather axis."""
+    """FSDP concatenates nonzero-axis shards before the post hook."""
     sharded_weight = _LinearShardedTensorWithMXFP8Compute(
         torch.randn(2, 48, 128, device="cuda", dtype=torch.bfloat16)
     )
@@ -504,8 +504,10 @@ def test_fsdp_hooks_support_a_non_zero_shard_dim():
         _StubMixedPrecisionPolicy(),
     )
 
-    assert comm_N2K.shape == (48, 2, 128)
-    gathered_N2K = torch.randn(96, 2, 128, device="cuda", dtype=torch.bfloat16)
+    assert comm_N2K.shape == (2, 48, 128)
+    gathered_N2K = torch.randn(2, 96, 128, device="cuda", dtype=torch.bfloat16).reshape(
+        4, 48, 128
+    )
     unsharded, inner_tensors = sharded_weight.fsdp_post_all_gather(
         (gathered_N2K,), metadata, torch.bfloat16
     )
