@@ -616,17 +616,20 @@ def test_mxfp8_grouped_linear_flattens_structured_w13(monkeypatch):
     assert output_R2O.shape == torch.Size([8, 2, 64])
 
 
+@pytest.mark.parametrize(
+    "linear_cls", [MXFP8Linear, NVFP4Linear], ids=["mxfp8", "nvfp4"]
+)
 @pytest.mark.filterwarnings("ignore:torch.distributed is disabled")
-def test_mxfp8_linear_dcp_round_trip_needs_no_safe_globals(tmp_path):
+def test_quantized_linear_dcp_round_trip_needs_no_safe_globals(tmp_path, linear_cls):
     import torch.distributed.checkpoint as dcp
 
     pytest.importorskip("torchao")
-    if MXFP8Linear is None:
-        pytest.skip("torchao MXFP8Linear is unavailable")
+    if linear_cls is None:
+        pytest.skip("torchao quantized Linear is unavailable")
     from torch.distributed.checkpoint import FileSystemReader
     from torch.distributed.checkpoint.metadata import TensorStorageMetadata
 
-    config = MXFP8Linear.Config(
+    config = linear_cls.Config(
         in_features=128,
         out_features=128,
         bias=False,
